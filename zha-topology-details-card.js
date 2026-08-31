@@ -1,6 +1,6 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.1
+ * Version: 1.2
  * Date: 2026-08-31
  *
  * Author: Corey Stup
@@ -9,12 +9,13 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.2 - 2026-08-31 - Display depth 15 as Max (15) and add friendly next-hop route-state pills.
  *   v1.1 - 2026-08-31 - Display Zigbee depth 255 (0xFF) as Unknown.
  *   v1.0 - 2026-08-31 - Initial public release.
  */
 
 /*
- * ZHA Topology Details Card v1.1
+ * ZHA Topology Details Card v1.2
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
@@ -255,12 +256,70 @@ class ZhaTopologyDetailsCard extends HTMLElement {
   _formatDepth(value) {
     if (value === undefined || value === null || value === "") return "—";
 
-    // Zigbee depth 0xFF (255) is a sentinel for unknown/not meaningful,
-    // not an actual 255-hop network depth.
     const numeric = Number(value);
+
+    // 15 (0x0F) is the maximum Zigbee network depth. Some stacks report this
+    // maximum value for peer-router entries where the value should not be
+    // casually interpreted as an actual 15-hop routing path.
+    if (Number.isFinite(numeric) && numeric === 0x0f) return "Max (15)";
+
+    // 255 (0xFF) is used by some stacks as an unknown/not-meaningful sentinel,
+    // not an actual 255-hop network depth.
     if (Number.isFinite(numeric) && numeric === 0xff) return "Unknown";
 
     return String(value);
+  }
+
+  _depthHtml(value) {
+    const label = this._formatDepth(value);
+    const numeric = Number(value);
+
+    if (Number.isFinite(numeric) && numeric === 0x0f) {
+      return `<span class="depth-tooltip" title="Reported Zigbee depth 15 — maximum defined network depth; may not represent the actual routing path.">${this._escape(label)}</span>`;
+    }
+
+    if (Number.isFinite(numeric) && numeric === 0xff) {
+      return `<span class="depth-tooltip" title="Reported Zigbee depth 255 (0xFF) — unknown/not meaningful sentinel, not an actual network depth.">${this._escape(label)}</span>`;
+    }
+
+    return this._escape(label);
+  }
+
+  _nextHopAnnotation(route) {
+    const nextHop = this._hexNwk(route?.next_hop).toUpperCase();
+    const status = String(route?.route_status || "").toLowerCase();
+
+    if (nextHop === "0XFFFE") {
+      if (status === "discovery_failed") {
+        return {
+          label: "No route",
+          className: "route-no-route",
+          title: "No valid next hop is known (0xFFFE); route discovery failed.",
+        };
+      }
+      if (status === "discovery_underway") {
+        return {
+          label: "Resolving",
+          className: "route-resolving",
+          title: "No valid next hop is known yet (0xFFFE); route discovery is underway.",
+        };
+      }
+      return {
+        label: "Unresolved",
+        className: "route-unresolved",
+        title: "No valid next hop is currently known (0xFFFE).",
+      };
+    }
+
+    if (this._sameNwk(route?.dest_nwk, route?.next_hop)) {
+      return {
+        label: "Direct",
+        className: "route-direct",
+        title: "Destination and next-hop NWK addresses are the same; this is a direct one-hop route.",
+      };
+    }
+
+    return null;
   }
 
   _indexes() {
@@ -358,7 +417,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.1`);
+    out.push(`Card version: v1.2`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -419,12 +478,13 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       for (const r of routes) {
         const dest = this._lookupNwk(r.dest_nwk, indexes);
         const hop = this._lookupNwk(r.next_hop, indexes);
+        const annotation = this._nextHopAnnotation(r);
         out.push(
           `  dest=${this._hexNwk(r.dest_nwk)}${
             dest ? ` (${this._name(dest)})` : ""
           } -> next=${this._hexNwk(r.next_hop)}${
             hop ? ` (${this._name(hop)})` : ""
-          } | status=${r.route_status || "—"} | many_to_one=${
+          }${annotation ? ` [${annotation.label}]` : ""} | status=${r.route_status || "—"} | many_to_one=${
             r.many_to_one
           } | memory_constrained=${r.memory_constrained} | route_record_required=${
             r.route_record_required
@@ -503,7 +563,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td class="mono">${this._escape(this._hexNwk(n.nwk))}</td>
                   <td class="mono ieee">${this._escape(n.ieee || "—")}</td>
                   <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._escape(this._formatDepth(n.depth))}</td>
+                  <td class="num">${this._depthHtml(n.depth)}</td>
                   <td>${this._escape(n.rx_on_when_idle || "—")}</td>
                   <td>${nd ? (nd.available ? "Yes" : "No") : "—"}</td>
                   <td>${this._escape(this._fmtLastSeen(nd?.last_seen))}</td>
@@ -538,7 +598,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td>${this._escape(n.device_type || "—")}</td>
                   <td>${this._nwkWithIeee(n.nwk, n.ieee)}</td>
                   <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._escape(this._formatDepth(n.depth))}</td>
+                  <td class="num">${this._depthHtml(n.depth)}</td>
                   <td>${this._escape(n.rx_on_when_idle || "—")}</td>
                   <td>${this._escape(n.permit_joining || "—")}</td>
                 </tr>`;
@@ -565,14 +625,15 @@ class ZhaTopologyDetailsCard extends HTMLElement {
               .map((r) => {
                 const dest = this._lookupNwk(r.dest_nwk, indexes);
                 const hop = this._lookupNwk(r.next_hop, indexes);
-                const direct = this._sameNwk(r.dest_nwk, r.next_hop);
+                const annotation = this._nextHopAnnotation(r);
+                const unresolved = this._hexNwk(r.next_hop).toUpperCase() === "0XFFFE";
                 return `<tr>
                   <td>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
                   <td>${this._escape(dest ? this._name(dest) : "—")}</td>
                   <td>${this._nwkWithIeee(r.next_hop, hop?.ieee)}</td>
                   <td>
-                    ${this._escape(hop ? this._name(hop) : "—")}
-                    ${direct ? `<span class="badge route-direct">Direct</span>` : ""}
+                    ${unresolved ? "" : this._escape(hop ? this._name(hop) : "—")}
+                    ${annotation ? `<span class="badge ${this._escape(annotation.className)}" title="${this._escape(annotation.title)}">${this._escape(annotation.label)}</span>` : ""}
                   </td>
                   <td><span class="badge route-${this._escape(String(r.route_status || "").toLowerCase())}">${this._escape(r.route_status || "—")}</span></td>
                   <td>${r.many_to_one ? "Yes" : "No"}</td>
@@ -737,7 +798,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
         }
         .ieee { font-size:.8rem; }
-        .nwk-tooltip { cursor:help; text-decoration:underline dotted; text-underline-offset:3px; }
+        .nwk-tooltip, .depth-tooltip { cursor:help; text-decoration:underline dotted; text-underline-offset:3px; }
         .muted { color:var(--secondary-text-color); font-size:.78rem; margin-top:2px; }
         .badge {
           display:inline-block; border-radius:999px; padding:2px 7px;
@@ -749,6 +810,17 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         .route-direct {
           font-weight:700;
           background:color-mix(in srgb,var(--primary-color) 16%,var(--secondary-background-color));
+        }
+        .route-no-route {
+          font-weight:700;
+          background:color-mix(in srgb,var(--error-color, #db4437) 18%,var(--secondary-background-color));
+        }
+        .route-resolving {
+          font-weight:700;
+          background:color-mix(in srgb,var(--warning-color, #ffa600) 18%,var(--secondary-background-color));
+        }
+        .route-unresolved {
+          font-weight:700;
         }
         .lqi-high { }
         .lqi-mid { }
@@ -838,8 +910,11 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           <b>Interpretation:</b> “Child” is the relationship reported in that router's
           Zigbee neighbor table. “Sibling”/“Parent” entries are one-hop router relationships.
           “Other neighbor” is the friendly display name for ZHA's raw
-          “NoneOfTheAbove” relationship value. Zigbee depth 255 (0xFF) is displayed as
-          “Unknown” because it is a sentinel value, not an actual hop depth.
+          “NoneOfTheAbove” relationship value. Zigbee depth 15 is displayed as
+          “Max (15)” because 15 is the maximum defined network depth and may not reflect the
+          actual routing path; depth 255 (0xFF) is displayed as “Unknown”. In routing tables,
+          0xFFFE remains visible as the raw next-hop value while the Next-hop device column
+          labels it “No route”, “Resolving”, or “Unresolved” according to route status.
           Visible neighbor/child tables and counts are
           de-duplicated by IEEE address (NWK fallback); Copy JSON preserves the raw ZHA data.
           Route-table destinations and next hops are separate from the neighbor table.
@@ -847,7 +922,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           depend on each device answering Zigbee management requests correctly.
         </div>
 
-        <div class="version-footer">ZHA Topology Details Card v1.1</div>
+        <div class="version-footer">ZHA Topology Details Card v1.2</div>
       </ha-card>
     `;
 
