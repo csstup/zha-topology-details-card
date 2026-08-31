@@ -1,6 +1,6 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.0
+ * Version: 1.1
  * Date: 2026-08-31
  *
  * Author: Corey Stup
@@ -9,11 +9,12 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.1 - 2026-08-31 - Display Zigbee depth 255 (0xFF) as Unknown.
  *   v1.0 - 2026-08-31 - Initial public release.
  */
 
 /*
- * ZHA Topology Details Card v1.0
+ * ZHA Topology Details Card v1.1
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
@@ -251,6 +252,17 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     return "lqi-low";
   }
 
+  _formatDepth(value) {
+    if (value === undefined || value === null || value === "") return "—";
+
+    // Zigbee depth 0xFF (255) is a sentinel for unknown/not meaningful,
+    // not an actual 255-hop network depth.
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric === 0xff) return "Unknown";
+
+    return String(value);
+  }
+
   _indexes() {
     const byIeee = new Map();
     const byNwk = new Map();
@@ -346,7 +358,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.0`);
+    out.push(`Card version: v1.1`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -380,7 +392,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           `  ${this._name(nd || n)} | ${this._hexNwk(n.nwk)} | ${
             n.ieee || "—"
           } | type=${n.device_type || "—"} | LQI=${n.lqi ?? "—"} | depth=${
-            n.depth ?? "—"
+            this._formatDepth(n.depth)
           } | rx_idle=${n.rx_on_when_idle || "—"}`
         );
       }
@@ -394,7 +406,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           `  ${this._name(nd || n)} | rel=${n.relationship || "—"} | type=${
             n.device_type || "—"
           } | ${this._hexNwk(n.nwk)} | LQI=${n.lqi ?? "—"} | depth=${
-            n.depth ?? "—"
+            this._formatDepth(n.depth)
           } | rx_idle=${n.rx_on_when_idle || "—"} | permit=${
             n.permit_joining || "—"
           }`
@@ -491,7 +503,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td class="mono">${this._escape(this._hexNwk(n.nwk))}</td>
                   <td class="mono ieee">${this._escape(n.ieee || "—")}</td>
                   <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._escape(n.depth ?? "—")}</td>
+                  <td class="num">${this._escape(this._formatDepth(n.depth))}</td>
                   <td>${this._escape(n.rx_on_when_idle || "—")}</td>
                   <td>${nd ? (nd.available ? "Yes" : "No") : "—"}</td>
                   <td>${this._escape(this._fmtLastSeen(nd?.last_seen))}</td>
@@ -526,7 +538,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td>${this._escape(n.device_type || "—")}</td>
                   <td>${this._nwkWithIeee(n.nwk, n.ieee)}</td>
                   <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._escape(n.depth ?? "—")}</td>
+                  <td class="num">${this._escape(this._formatDepth(n.depth))}</td>
                   <td>${this._escape(n.rx_on_when_idle || "—")}</td>
                   <td>${this._escape(n.permit_joining || "—")}</td>
                 </tr>`;
@@ -826,14 +838,16 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           <b>Interpretation:</b> “Child” is the relationship reported in that router's
           Zigbee neighbor table. “Sibling”/“Parent” entries are one-hop router relationships.
           “Other neighbor” is the friendly display name for ZHA's raw
-          “NoneOfTheAbove” relationship value. Visible neighbor/child tables and counts are
+          “NoneOfTheAbove” relationship value. Zigbee depth 255 (0xFF) is displayed as
+          “Unknown” because it is a sentinel value, not an actual hop depth.
+          Visible neighbor/child tables and counts are
           de-duplicated by IEEE address (NWK fallback); Copy JSON preserves the raw ZHA data.
           Route-table destinations and next hops are separate from the neighbor table.
           A missing sleepy child is not absolute proof of a different parent: topology scans
           depend on each device answering Zigbee management requests correctly.
         </div>
 
-        <div class="version-footer">ZHA Topology Details Card v1.0</div>
+        <div class="version-footer">ZHA Topology Details Card v1.1</div>
       </ha-card>
     `;
 
