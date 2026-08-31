@@ -1,6 +1,6 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.2
+ * Version: 1.3
  * Date: 2026-08-31
  *
  * Author: Corey Stup
@@ -9,13 +9,14 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.3 - 2026-08-31 - Fix progressive topology-scan refreshes, stabilize the header/status layout, and add sortable table columns.
  *   v1.2 - 2026-08-31 - Display depth 15 as Max (15) and add friendly next-hop route-state pills.
  *   v1.1 - 2026-08-31 - Display Zigbee depth 255 (0xFF) as Unknown.
  *   v1.0 - 2026-08-31 - Initial public release.
  */
 
 /*
- * ZHA Topology Details Card v1.2
+ * ZHA Topology Details Card v1.3
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
@@ -39,6 +40,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     this._status = "";
     this._lastLoaded = null;
     this._scanTimers = [];
+    this._sortState = new Map();
   }
 
   setConfig(config) {
@@ -82,7 +84,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       this._devices = Array.isArray(devices) ? devices : [];
       this._lastLoaded = new Date();
       this._loaded = true;
-      this._status = `Loaded ${this._devices.length} devices`;
+      this._status = "Snapshot loaded";
     } catch (err) {
       this._status = `Error: ${err?.message || err}`;
       console.error("ZHA topology card:", err);
@@ -94,30 +96,62 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   async _scanTopology() {
     if (!this._hass) return;
+
     this._clearScanTimers();
-    this._status = "Topology scan requested…";
-    this._render();
+
+    // Home Assistant's zha/topology/update command starts the topology scan
+    // asynchronously and does not send a WebSocket result response. Use
+    // sendMessage() (fire-and-forget) rather than sendMessagePromise(), or the
+    // promise would never resolve and the delayed snapshot reloads below would
+    // never be scheduled.
+    const delays = [5000, 12000, 25000, 45000];
+
     try {
-      await this._hass.connection.sendMessagePromise({
+      this._hass.connection.sendMessage({
         type: "zha/topology/update",
       });
-      // The API starts the scan asynchronously; it does not return a "scan complete"
-      // event. Re-read the snapshot a few times while routers reply.
-      const delays = [5000, 12000, 25000, 45000];
+
+      this._status = "Scan running · waiting for refresh 1/4";
+      this._render();
+
       delays.forEach((delay, idx) => {
-        const timer = setTimeout(() => {
-          this._loadDevices(
-            idx === delays.length - 1
-              ? "Loading final scan snapshot…"
-              : `Loading scan snapshot ${idx + 1}/${delays.length}…`
+        const refreshNumber = idx + 1;
+        const timer = setTimeout(async () => {
+          await this._loadDevices(
+            `Scan running · refresh ${refreshNumber}/${delays.length}…`
           );
+
+          // _loadDevices updates the snapshot timestamp after a successful
+          // zha/devices read. Replace its generic status with scan progress so
+          // it is obvious that the automatic refresh sequence is advancing.
+          if (refreshNumber === delays.length) {
+            this._status = "Scan refresh complete";
+            this._scanTimers = [];
+          } else {
+            this._status =
+              `Scan running · refresh ${refreshNumber}/${delays.length} complete`;
+          }
+          this._render();
         }, delay);
+
         this._scanTimers.push(timer);
       });
     } catch (err) {
       this._status = `Scan error: ${err?.message || err}`;
       this._render();
     }
+  }
+
+  _statusLine() {
+    if (!this._lastLoaded) return this._status || "Ready";
+
+    const time = this._lastLoaded.toLocaleTimeString();
+
+    if (!this._status || this._status === "Snapshot loaded") {
+      return `Snapshot ${time}`;
+    }
+
+    return `${this._status} · snapshot ${time}`;
   }
 
   _openMap() {
@@ -417,7 +451,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.2`);
+    out.push(`Card version: v1.3`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -502,6 +536,200 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     this._render();
   }
 
+
+  _sortableTh(label, type = "text", className = "") {
+    const cls = `sortable${className ? ` ${className}` : ""}`;
+    return `<th class="${this._escape(cls)}" data-sort-type="${this._escape(
+      type
+    )}" tabindex="0" role="button" title="Sort by ${this._escape(
+      label
+    )}">${this._escape(label)}</th>`;
+  }
+
+  _sortAttrs(value, secondary = null) {
+    if (value === null || value === undefined || value === "") {
+      return ' data-sort-missing="1"';
+    }
+
+    const secondaryAttr =
+      secondary === null || secondary === undefined || secondary === ""
+        ? ""
+        : ` data-sort-secondary="${this._escape(secondary)}"`;
+
+    return ` data-sort-value="${this._escape(value)}"${secondaryAttr}`;
+  }
+
+  _nwkSortValue(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const normalized = this._hexNwk(value);
+    if (!/^0x[0-9a-f]+$/i.test(normalized)) return null;
+    return parseInt(normalized, 16);
+  }
+
+  _timeSortValue(value) {
+    if (!value) return null;
+    try {
+      const d =
+        typeof value === "number"
+          ? new Date(value < 2e10 ? value * 1000 : value)
+          : new Date(value);
+      const t = d.getTime();
+      return Number.isFinite(t) ? t : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _depthSortValue(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n === 0xff) return null;
+    return n;
+  }
+
+  _routeStatusSortValue(value) {
+    const status = String(value || "").toLowerCase();
+    const ranks = {
+      active: 0,
+      discovery_underway: 1,
+      discovery_failed: 2,
+    };
+    return Object.prototype.hasOwnProperty.call(ranks, status)
+      ? ranks[status]
+      : 3;
+  }
+
+  _compareSortCells(cellA, cellB, type, direction) {
+    const missingA = cellA?.dataset?.sortMissing === "1";
+    const missingB = cellB?.dataset?.sortMissing === "1";
+
+    // Missing/unknown values always stay at the bottom, regardless of direction.
+    if (missingA !== missingB) return missingA ? 1 : -1;
+    if (missingA && missingB) return 0;
+
+    const a = cellA?.dataset?.sortValue ?? "";
+    const b = cellB?.dataset?.sortValue ?? "";
+    let cmp = 0;
+
+    if (type === "number") {
+      const an = Number(a);
+      const bn = Number(b);
+      cmp = an === bn ? 0 : an < bn ? -1 : 1;
+    } else {
+      cmp = String(a).localeCompare(String(b), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+    }
+
+    if (cmp === 0) {
+      const as = cellA?.dataset?.sortSecondary;
+      const bs = cellB?.dataset?.sortSecondary;
+
+      if (as !== undefined || bs !== undefined) {
+        const an = Number(as);
+        const bn = Number(bs);
+
+        if (
+          as !== undefined &&
+          bs !== undefined &&
+          Number.isFinite(an) &&
+          Number.isFinite(bn)
+        ) {
+          cmp = an === bn ? 0 : an < bn ? -1 : 1;
+        } else {
+          cmp = String(as ?? "").localeCompare(String(bs ?? ""), undefined, {
+            numeric: true,
+            sensitivity: "base",
+          });
+        }
+      }
+    }
+
+    return direction === "desc" ? -cmp : cmp;
+  }
+
+  _applySort(table, columnIndex, direction) {
+    if (!table) return;
+
+    const headers = Array.from(table.querySelectorAll("thead th.sortable"));
+    const allHeaders = Array.from(table.querySelectorAll("thead th"));
+    const activeHeader = allHeaders[columnIndex];
+
+    if (!activeHeader?.classList.contains("sortable")) return;
+
+    const type = activeHeader.dataset.sortType || "text";
+    const tbody = table.tBodies?.[0];
+    if (!tbody) return;
+
+    const rows = Array.from(tbody.rows).map((row, originalIndex) => ({
+      row,
+      originalIndex,
+    }));
+
+    rows.sort((a, b) => {
+      const cmp = this._compareSortCells(
+        a.row.cells[columnIndex],
+        b.row.cells[columnIndex],
+        type,
+        direction
+      );
+      return cmp || a.originalIndex - b.originalIndex;
+    });
+
+    for (const { row } of rows) tbody.appendChild(row);
+
+    for (const th of headers) {
+      th.removeAttribute("aria-sort");
+    }
+    activeHeader.setAttribute(
+      "aria-sort",
+      direction === "desc" ? "descending" : "ascending"
+    );
+  }
+
+  _sortTableFromHeader(th) {
+    const table = th?.closest("table");
+    const tableKey = table?.dataset?.sortKey;
+    if (!table || !tableKey) return;
+
+    const headers = Array.from(table.querySelectorAll("thead th"));
+    const columnIndex = headers.indexOf(th);
+    if (columnIndex < 0) return;
+
+    const previous = this._sortState.get(tableKey);
+    const direction =
+      previous?.columnIndex === columnIndex && previous?.direction === "asc"
+        ? "desc"
+        : "asc";
+
+    this._sortState.set(tableKey, { columnIndex, direction });
+    this._applySort(table, columnIndex, direction);
+  }
+
+  _wireSorting() {
+    const tables = Array.from(
+      this.shadowRoot?.querySelectorAll("table[data-sort-key]") || []
+    );
+
+    for (const table of tables) {
+      for (const th of table.querySelectorAll("thead th.sortable")) {
+        th.addEventListener("click", () => this._sortTableFromHeader(th));
+        th.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            this._sortTableFromHeader(th);
+          }
+        });
+      }
+
+      const state = this._sortState.get(table.dataset.sortKey);
+      if (state) {
+        this._applySort(table, state.columnIndex, state.direction);
+      }
+    }
+  }
+
   _routerSummaryRows(indexes) {
     return this._devices
       .filter((d) => this._isRouterDevice(d))
@@ -513,7 +741,9 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       .map((d) => {
         const neighbors = this._uniqueNeighbors(d.neighbors);
         const children = neighbors.filter((n) => this._isChild(n));
-        const routerNeighbors = neighbors.filter((n) => this._isRouterNeighbor(n));
+        const routerNeighbors = neighbors.filter((n) =>
+          this._isRouterNeighbor(n)
+        );
         const routes = d.routes || [];
         const activeRoutes = routes.filter(
           (r) => String(r.route_status || "").toLowerCase() === "active"
@@ -521,19 +751,36 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
         return `
           <tr>
-            <td>
+            <td${this._sortAttrs(this._name(d))}>
               <strong>${this._escape(this._name(d))}</strong>
-              ${d.active_coordinator ? '<span class="badge coord">Coordinator</span>' : ""}
-              <div class="muted">${this._escape(d.manufacturer || "")} ${this._escape(d.model || "")}</div>
+              ${
+                d.active_coordinator
+                  ? '<span class="badge coord">Coordinator</span>'
+                  : ""
+              }
+              <div class="muted">${this._escape(
+                d.manufacturer || ""
+              )} ${this._escape(d.model || "")}</div>
             </td>
-            <td class="mono">${this._escape(this._hexNwk(d.nwk))}</td>
-            <td class="num strong">${children.length}</td>
-            <td class="num">${routerNeighbors.length}</td>
-            <td class="num">${neighbors.length}</td>
-            <td class="num">${activeRoutes}/${routes.length}</td>
-            <td class="num ${this._lqiClass(d.lqi)}">${this._escape(d.lqi ?? "—")}</td>
-            <td class="num">${this._escape(d.rssi ?? "—")}</td>
-            <td>${this._escape(this._fmtLastSeen(d.last_seen))}</td>
+            <td class="mono"${this._sortAttrs(this._nwkSortValue(d.nwk))}>${this._escape(
+              this._hexNwk(d.nwk)
+            )}</td>
+            <td class="num strong"${this._sortAttrs(children.length)}>${children.length}</td>
+            <td class="num"${this._sortAttrs(routerNeighbors.length)}>${routerNeighbors.length}</td>
+            <td class="num"${this._sortAttrs(neighbors.length)}>${neighbors.length}</td>
+            <td class="num"${this._sortAttrs(
+              activeRoutes,
+              routes.length
+            )}>${activeRoutes}/${routes.length}</td>
+            <td class="num ${this._lqiClass(d.lqi)}"${this._sortAttrs(
+              d.lqi
+            )}>${this._escape(d.lqi ?? "—")}</td>
+            <td class="num"${this._sortAttrs(d.rssi)}>${this._escape(
+              d.rssi ?? "—"
+            )}</td>
+            <td${this._sortAttrs(this._timeSortValue(d.last_seen))}>${this._escape(
+              this._fmtLastSeen(d.last_seen)
+            )}</td>
           </tr>`;
       })
       .join("");
@@ -543,30 +790,65 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     const children = this._uniqueNeighbors(d.neighbors).filter((n) =>
       this._isChild(n)
     );
-    if (!children.length) return `<div class="empty">No direct children reported.</div>`;
+    if (!children.length)
+      return `<div class="empty">No direct children reported.</div>`;
+
+    const tableKey = `children:${String(d.ieee || this._hexNwk(d.nwk))}`;
+
     return `
       <div class="table-wrap">
-        <table>
+        <table data-sort-key="${this._escape(tableKey)}">
           <thead><tr>
-            <th>Child</th><th>Type</th><th>NWK</th><th>IEEE</th>
-            <th>LQI</th><th>Depth</th><th>Rx on idle</th><th>Available</th><th>Last seen</th>
+            ${this._sortableTh("Child")}
+            ${this._sortableTh("Type")}
+            ${this._sortableTh("NWK", "number")}
+            ${this._sortableTh("IEEE")}
+            ${this._sortableTh("LQI", "number", "num")}
+            ${this._sortableTh("Depth", "number", "num")}
+            ${this._sortableTh("Rx on idle")}
+            ${this._sortableTh("Available", "number")}
+            ${this._sortableTh("Last seen", "number")}
           </tr></thead>
           <tbody>
             ${children
               .map((n) => {
                 const nd = this._lookupNeighbor(n, indexes);
+                const available =
+                  nd === undefined || nd === null ? null : nd.available ? 1 : 0;
                 return `<tr>
-                  <td><strong>${this._escape(this._name(nd || n))}</strong>
-                    <div class="muted">${this._escape(nd?.manufacturer || "")} ${this._escape(nd?.model || "")}</div>
+                  <td${this._sortAttrs(this._name(nd || n))}><strong>${this._escape(
+                    this._name(nd || n)
+                  )}</strong>
+                    <div class="muted">${this._escape(
+                      nd?.manufacturer || ""
+                    )} ${this._escape(nd?.model || "")}</div>
                   </td>
-                  <td>${this._escape(n.device_type || nd?.device_type || "—")}</td>
-                  <td class="mono">${this._escape(this._hexNwk(n.nwk))}</td>
-                  <td class="mono ieee">${this._escape(n.ieee || "—")}</td>
-                  <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._depthHtml(n.depth)}</td>
-                  <td>${this._escape(n.rx_on_when_idle || "—")}</td>
-                  <td>${nd ? (nd.available ? "Yes" : "No") : "—"}</td>
-                  <td>${this._escape(this._fmtLastSeen(nd?.last_seen))}</td>
+                  <td${this._sortAttrs(
+                    n.device_type || nd?.device_type || null
+                  )}>${this._escape(
+                    n.device_type || nd?.device_type || "—"
+                  )}</td>
+                  <td class="mono"${this._sortAttrs(
+                    this._nwkSortValue(n.nwk)
+                  )}>${this._escape(this._hexNwk(n.nwk))}</td>
+                  <td class="mono ieee"${this._sortAttrs(n.ieee)}>${this._escape(
+                    n.ieee || "—"
+                  )}</td>
+                  <td class="num ${this._lqiClass(n.lqi)}"${this._sortAttrs(
+                    n.lqi
+                  )}>${this._escape(n.lqi ?? "—")}</td>
+                  <td class="num"${this._sortAttrs(
+                    this._depthSortValue(n.depth)
+                  )}>${this._depthHtml(n.depth)}</td>
+                  <td${this._sortAttrs(n.rx_on_when_idle)}>${this._escape(
+                    n.rx_on_when_idle || "—"
+                  )}</td>
+                  <td${this._sortAttrs(available)}>${
+                    nd ? (nd.available ? "Yes" : "No") : "—"
+                  }</td>
+                  <td${this._sortAttrs(
+                    this._timeSortValue(nd?.last_seen)
+                  )}>${this._escape(this._fmtLastSeen(nd?.last_seen))}</td>
                 </tr>`;
               })
               .join("")}
@@ -577,13 +859,23 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   _neighborsTable(d, indexes) {
     const neighbors = this._uniqueNeighbors(d.neighbors);
-    if (!neighbors.length) return `<div class="empty">No neighbor entries reported.</div>`;
+    if (!neighbors.length)
+      return `<div class="empty">No neighbor entries reported.</div>`;
+
+    const tableKey = `neighbors:${String(d.ieee || this._hexNwk(d.nwk))}`;
+
     return `
       <div class="table-wrap">
-        <table>
+        <table data-sort-key="${this._escape(tableKey)}">
           <thead><tr>
-            <th>Neighbor</th><th>Relationship</th><th>Type</th><th>NWK</th>
-            <th>LQI</th><th>Depth</th><th>Rx on idle</th><th>Permit joining</th>
+            ${this._sortableTh("Neighbor")}
+            ${this._sortableTh("Relationship")}
+            ${this._sortableTh("Type")}
+            ${this._sortableTh("NWK", "number")}
+            ${this._sortableTh("LQI", "number", "num")}
+            ${this._sortableTh("Depth", "number", "num")}
+            ${this._sortableTh("Rx on idle")}
+            ${this._sortableTh("Permit joining")}
           </tr></thead>
           <tbody>
             ${neighbors
@@ -591,16 +883,34 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                 const nd = this._lookupNeighbor(n, indexes);
                 const rel = this._normRelationship(n.relationship);
                 return `<tr>
-                  <td><strong>${this._escape(this._name(nd || n))}</strong>
+                  <td${this._sortAttrs(this._name(nd || n))}><strong>${this._escape(
+                    this._name(nd || n)
+                  )}</strong>
                     <div class="muted">${this._escape(nd?.model || "")}</div>
                   </td>
-                  <td><span class="badge rel-${this._escape(rel.replaceAll(" ", "-"))}">${this._escape(this._relationshipLabel(n.relationship))}</span></td>
-                  <td>${this._escape(n.device_type || "—")}</td>
-                  <td>${this._nwkWithIeee(n.nwk, n.ieee)}</td>
-                  <td class="num ${this._lqiClass(n.lqi)}">${this._escape(n.lqi ?? "—")}</td>
-                  <td class="num">${this._depthHtml(n.depth)}</td>
-                  <td>${this._escape(n.rx_on_when_idle || "—")}</td>
-                  <td>${this._escape(n.permit_joining || "—")}</td>
+                  <td${this._sortAttrs(this._relationshipLabel(n.relationship))}><span class="badge rel-${this._escape(
+                    rel.replaceAll(" ", "-")
+                  )}">${this._escape(
+                    this._relationshipLabel(n.relationship)
+                  )}</span></td>
+                  <td${this._sortAttrs(n.device_type)}>${this._escape(
+                    n.device_type || "—"
+                  )}</td>
+                  <td${this._sortAttrs(
+                    this._nwkSortValue(n.nwk)
+                  )}>${this._nwkWithIeee(n.nwk, n.ieee)}</td>
+                  <td class="num ${this._lqiClass(n.lqi)}"${this._sortAttrs(
+                    n.lqi
+                  )}>${this._escape(n.lqi ?? "—")}</td>
+                  <td class="num"${this._sortAttrs(
+                    this._depthSortValue(n.depth)
+                  )}>${this._depthHtml(n.depth)}</td>
+                  <td${this._sortAttrs(n.rx_on_when_idle)}>${this._escape(
+                    n.rx_on_when_idle || "—"
+                  )}</td>
+                  <td${this._sortAttrs(n.permit_joining)}>${this._escape(
+                    n.permit_joining || "—"
+                  )}</td>
                 </tr>`;
               })
               .join("")}
@@ -611,14 +921,23 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   _routesTable(d, indexes) {
     const routes = d.routes || [];
-    if (!routes.length) return `<div class="empty">No route entries reported.</div>`;
+    if (!routes.length)
+      return `<div class="empty">No route entries reported.</div>`;
+
+    const tableKey = `routes:${String(d.ieee || this._hexNwk(d.nwk))}`;
+
     return `
       <div class="table-wrap">
-        <table>
+        <table data-sort-key="${this._escape(tableKey)}">
           <thead><tr>
-            <th>Destination</th><th>Destination device</th>
-            <th>Next hop</th><th>Next-hop device</th><th>Status</th>
-            <th>Many-to-one</th><th>Memory constrained</th><th>Route record req.</th>
+            ${this._sortableTh("Destination", "number")}
+            ${this._sortableTh("Destination device")}
+            ${this._sortableTh("Next hop", "number")}
+            ${this._sortableTh("Next-hop device")}
+            ${this._sortableTh("Status", "number")}
+            ${this._sortableTh("Many-to-one", "number")}
+            ${this._sortableTh("Memory constrained", "number")}
+            ${this._sortableTh("Route record req.", "number")}
           </tr></thead>
           <tbody>
             ${routes
@@ -626,19 +945,51 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                 const dest = this._lookupNwk(r.dest_nwk, indexes);
                 const hop = this._lookupNwk(r.next_hop, indexes);
                 const annotation = this._nextHopAnnotation(r);
-                const unresolved = this._hexNwk(r.next_hop).toUpperCase() === "0XFFFE";
+                const unresolved =
+                  this._hexNwk(r.next_hop).toUpperCase() === "0XFFFE";
+                const hopDeviceSort = unresolved
+                  ? annotation?.label || "Unresolved"
+                  : hop
+                  ? this._name(hop)
+                  : null;
+
                 return `<tr>
-                  <td>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
-                  <td>${this._escape(dest ? this._name(dest) : "—")}</td>
-                  <td>${this._nwkWithIeee(r.next_hop, hop?.ieee)}</td>
-                  <td>
+                  <td${this._sortAttrs(
+                    this._nwkSortValue(r.dest_nwk)
+                  )}>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
+                  <td${this._sortAttrs(dest ? this._name(dest) : null)}>${this._escape(
+                    dest ? this._name(dest) : "—"
+                  )}</td>
+                  <td${this._sortAttrs(
+                    this._nwkSortValue(r.next_hop)
+                  )}>${this._nwkWithIeee(r.next_hop, hop?.ieee)}</td>
+                  <td${this._sortAttrs(hopDeviceSort)}>
                     ${unresolved ? "" : this._escape(hop ? this._name(hop) : "—")}
-                    ${annotation ? `<span class="badge ${this._escape(annotation.className)}" title="${this._escape(annotation.title)}">${this._escape(annotation.label)}</span>` : ""}
+                    ${
+                      annotation
+                        ? `<span class="badge ${this._escape(
+                            annotation.className
+                          )}" title="${this._escape(
+                            annotation.title
+                          )}">${this._escape(annotation.label)}</span>`
+                        : ""
+                    }
                   </td>
-                  <td><span class="badge route-${this._escape(String(r.route_status || "").toLowerCase())}">${this._escape(r.route_status || "—")}</span></td>
-                  <td>${r.many_to_one ? "Yes" : "No"}</td>
-                  <td>${r.memory_constrained ? "Yes" : "No"}</td>
-                  <td>${r.route_record_required ? "Yes" : "No"}</td>
+                  <td${this._sortAttrs(
+                    this._routeStatusSortValue(r.route_status),
+                    String(r.route_status || "")
+                  )}><span class="badge route-${this._escape(
+                    String(r.route_status || "").toLowerCase()
+                  )}">${this._escape(r.route_status || "—")}</span></td>
+                  <td${this._sortAttrs(r.many_to_one ? 1 : 0)}>${
+                    r.many_to_one ? "Yes" : "No"
+                  }</td>
+                  <td${this._sortAttrs(r.memory_constrained ? 1 : 0)}>${
+                    r.memory_constrained ? "Yes" : "No"
+                  }</td>
+                  <td${this._sortAttrs(r.route_record_required ? 1 : 0)}>${
+                    r.route_record_required ? "Yes" : "No"
+                  }</td>
                 </tr>`;
               })
               .join("")}
@@ -699,10 +1050,13 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   _endDeviceTable(indexes) {
     if (!this._config.show_end_devices) return "";
+
     const ends = this._devices
       .filter((d) => !this._isRouterDevice(d))
       .sort((a, b) => this._name(a).localeCompare(this._name(b)));
+
     if (!ends.length) return "";
+
     // Find reported parent by searching router neighbor tables for Child relationship.
     const parentMap = new Map();
     for (const r of this._devices.filter((d) => this._isRouterDevice(d))) {
@@ -712,28 +1066,50 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         }
       }
     }
+
     return `
       <h3>End devices / reported parents</h3>
       <div class="table-wrap">
-        <table>
+        <table data-sort-key="end-devices">
           <thead><tr>
-            <th>End device</th><th>NWK</th><th>Reported parent</th><th>Device LQI</th>
-            <th>RSSI</th><th>Available</th><th>Last seen</th>
+            ${this._sortableTh("End device")}
+            ${this._sortableTh("NWK", "number")}
+            ${this._sortableTh("Reported parent")}
+            ${this._sortableTh("Device LQI", "number", "num")}
+            ${this._sortableTh("RSSI", "number", "num")}
+            ${this._sortableTh("Available", "number")}
+            ${this._sortableTh("Last seen", "number")}
           </tr></thead>
           <tbody>
             ${ends
               .map((d) => {
                 const p = parentMap.get(String(d.ieee || "").toLowerCase());
                 return `<tr>
-                  <td><strong>${this._escape(this._name(d))}</strong>
-                    <div class="muted">${this._escape(d.manufacturer || "")} ${this._escape(d.model || "")}</div>
+                  <td${this._sortAttrs(this._name(d))}><strong>${this._escape(
+                    this._name(d)
+                  )}</strong>
+                    <div class="muted">${this._escape(
+                      d.manufacturer || ""
+                    )} ${this._escape(d.model || "")}</div>
                   </td>
-                  <td class="mono">${this._escape(this._hexNwk(d.nwk))}</td>
-                  <td>${this._escape(p ? this._name(p) : "Not reported")}</td>
-                  <td class="num ${this._lqiClass(d.lqi)}">${this._escape(d.lqi ?? "—")}</td>
-                  <td class="num">${this._escape(d.rssi ?? "—")}</td>
-                  <td>${d.available ? "Yes" : "No"}</td>
-                  <td>${this._escape(this._fmtLastSeen(d.last_seen))}</td>
+                  <td class="mono"${this._sortAttrs(
+                    this._nwkSortValue(d.nwk)
+                  )}>${this._escape(this._hexNwk(d.nwk))}</td>
+                  <td${this._sortAttrs(p ? this._name(p) : "Not reported")}>${this._escape(
+                    p ? this._name(p) : "Not reported"
+                  )}</td>
+                  <td class="num ${this._lqiClass(d.lqi)}"${this._sortAttrs(
+                    d.lqi
+                  )}>${this._escape(d.lqi ?? "—")}</td>
+                  <td class="num"${this._sortAttrs(d.rssi)}>${this._escape(
+                    d.rssi ?? "—"
+                  )}</td>
+                  <td${this._sortAttrs(d.available ? 1 : 0)}>${
+                    d.available ? "Yes" : "No"
+                  }</td>
+                  <td${this._sortAttrs(
+                    this._timeSortValue(d.last_seen)
+                  )}>${this._escape(this._fmtLastSeen(d.last_seen))}</td>
                 </tr>`;
               })
               .join("")}
@@ -752,13 +1128,22 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         :host { display: block; }
         ha-card { padding: 16px; overflow: hidden; }
         .header {
-          display:flex; gap:12px; justify-content:space-between; align-items:flex-start;
-          flex-wrap:wrap; margin-bottom:12px;
+          display:grid;
+          grid-template-columns:minmax(0, 1fr) auto;
+          grid-template-areas:
+            "title toolbar"
+            "status status";
+          column-gap:12px;
+          row-gap:5px;
+          align-items:start;
+          margin-bottom:12px;
         }
+        .header-title { grid-area:title; min-width:0; }
+        .header-status { grid-area:status; min-width:0; }
         h2 { margin:0; font-size:1.35rem; }
         h3 { margin:22px 0 10px; font-size:1.1rem; }
         h4 { margin:18px 0 8px; }
-        .toolbar { display:flex; gap:8px; flex-wrap:wrap; }
+        .toolbar { grid-area:toolbar; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
         button {
           border:1px solid var(--divider-color);
           background:var(--card-background-color);
@@ -771,7 +1156,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           border-color:var(--primary-color);
         }
         button:disabled { opacity:.55; cursor:default; }
-        .status { color:var(--secondary-text-color); font-size:.88rem; margin-top:5px; }
+        .status { color:var(--secondary-text-color); font-size:.88rem; }
         .stats {
           display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr));
           gap:8px; margin:12px 0 18px;
@@ -791,6 +1176,30 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         th {
           color:var(--secondary-text-color); font-size:.78rem;
           text-transform:uppercase; letter-spacing:.02em;
+        }
+        th.sortable {
+          cursor:pointer;
+          user-select:none;
+          -webkit-user-select:none;
+        }
+        th.sortable:hover, th.sortable:focus-visible {
+          color:var(--primary-text-color);
+        }
+        th.sortable::after {
+          content:"↕";
+          display:inline-block;
+          margin-left:.35em;
+          font-size:.78em;
+          opacity:.28;
+          vertical-align:.08em;
+        }
+        th.sortable[aria-sort="ascending"]::after {
+          content:"▲";
+          opacity:.85;
+        }
+        th.sortable[aria-sort="descending"]::after {
+          content:"▼";
+          opacity:.85;
         }
         td.num, th.num { text-align:right; }
         .strong { font-weight:700; }
@@ -852,6 +1261,14 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         }
         @media (max-width: 700px) {
           ha-card { padding:12px; }
+          .header {
+            grid-template-columns:1fr;
+            grid-template-areas:
+              "title"
+              "status"
+              "toolbar";
+          }
+          .toolbar { justify-content:flex-start; }
           th, td { padding:6px; }
           .summary-counts { display:none; }
         }
@@ -859,16 +1276,8 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
       <ha-card>
         <div class="header">
-          <div>
+          <div class="header-title">
             <h2>${this._escape(this._config.title)}</h2>
-            <div class="status">
-              ${this._escape(this._status || "Ready")}
-              ${
-                this._lastLoaded
-                  ? ` · snapshot ${this._escape(this._lastLoaded.toLocaleTimeString())}`
-                  : ""
-              }
-            </div>
           </div>
           <div class="toolbar">
             <button id="open-map">ZHA map</button>
@@ -876,6 +1285,9 @@ class ZhaTopologyDetailsCard extends HTMLElement {
             <button id="scan" class="primary">Scan topology</button>
             <button id="copy-text" ${!this._devices.length ? "disabled" : ""}>Copy text</button>
             <button id="copy-json" ${!this._devices.length ? "disabled" : ""}>Copy JSON</button>
+          </div>
+          <div class="header-status">
+            <div class="status">${this._escape(this._statusLine())}</div>
           </div>
         </div>
 
@@ -890,12 +1302,17 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
         <h3>Router summary</h3>
         <div class="table-wrap">
-          <table>
+          <table data-sort-key="router-summary">
             <thead><tr>
-              <th>Router</th><th>NWK</th><th class="num">Children</th>
-              <th class="num">Router nbrs</th><th class="num">All nbrs</th>
-              <th class="num">Active/Routes</th><th class="num">LQI</th>
-              <th class="num">RSSI</th><th>Last seen</th>
+              ${this._sortableTh("Router")}
+              ${this._sortableTh("NWK", "number")}
+              ${this._sortableTh("Children", "number", "num")}
+              ${this._sortableTh("Router nbrs", "number", "num")}
+              ${this._sortableTh("All nbrs", "number", "num")}
+              ${this._sortableTh("Active/Routes", "number", "num")}
+              ${this._sortableTh("LQI", "number", "num")}
+              ${this._sortableTh("RSSI", "number", "num")}
+              ${this._sortableTh("Last seen", "number")}
             </tr></thead>
             <tbody>${this._routerSummaryRows(indexes)}</tbody>
           </table>
@@ -915,14 +1332,16 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           actual routing path; depth 255 (0xFF) is displayed as “Unknown”. In routing tables,
           0xFFFE remains visible as the raw next-hop value while the Next-hop device column
           labels it “No route”, “Resolving”, or “Unresolved” according to route status.
-          Visible neighbor/child tables and counts are
-          de-duplicated by IEEE address (NWK fallback); Copy JSON preserves the raw ZHA data.
+          Click or tap any table heading to sort that table; click again to reverse
+          the sort. Sort choices are kept independently for each table while the card is loaded.
+          Visible neighbor/child tables and counts are de-duplicated by IEEE address (NWK fallback);
+          Copy JSON preserves the raw ZHA data.
           Route-table destinations and next hops are separate from the neighbor table.
           A missing sleepy child is not absolute proof of a different parent: topology scans
           depend on each device answering Zigbee management requests correctly.
         </div>
 
-        <div class="version-footer">ZHA Topology Details Card v1.2</div>
+        <div class="version-footer">ZHA Topology Details Card v1.3</div>
       </ha-card>
     `;
 
@@ -931,6 +1350,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     this.shadowRoot.getElementById("scan")?.addEventListener("click", () => this._scanTopology());
     this.shadowRoot.getElementById("copy-text")?.addEventListener("click", () => this._copyText());
     this.shadowRoot.getElementById("copy-json")?.addEventListener("click", () => this._copyJson());
+    this._wireSorting();
   }
 }
 
@@ -942,6 +1362,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "zha-topology-details-card",
   name: "ZHA Topology Details",
-  description: "Detailed ZHA child, neighbor, and routing tables with topology scan controls.",
+  description: "Detailed sortable ZHA child, neighbor, and routing tables with topology scan controls.",
   preview: false,
 });
