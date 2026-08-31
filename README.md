@@ -5,12 +5,16 @@ A Home Assistant Lovelace custom card for inspecting ZHA Zigbee topology details
 ## Features
 
 - Router summary
+- Click/tap sortable table headings with ascending/descending indicators
 - Direct child devices
 - Full neighbor tables
 - Routing tables
 - Direct-route identification
+- Friendly next-hop route-state pills for unresolved `0xFFFE` routes
+- Zigbee depth display helpers (`Max (15)` and `Unknown` for `255`)
 - LQI and RSSI details
 - ZHA topology scan control
+- Progressive automatic snapshot refreshes after a topology scan
 - Text and JSON topology export
 - De-duplication of duplicate neighbor entries in the visible report
 - IEEE addresses available as tooltips on wider tables
@@ -76,7 +80,7 @@ allows the topology report to use a wide layout.
 
 ## Version
 
-Current public release: **v1.0**
+Current public release: **v1.3**
 
 ## Author
 
