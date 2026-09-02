@@ -8,10 +8,15 @@ A Home Assistant Lovelace custom card for inspecting detailed ZHA Zigbee topolog
 - Direct child devices
 - Full neighbor tables
 - Routing tables with resolved device names
+- Inferred multi-hop route paths built from reported next hops
+- Coordinator route-path summary with hop-count pills
+- Path diagnostics for incomplete paths, possible loops, unknown/stale destinations, and routers that report no routing table
 - Click/tap column sorting on all data tables
 - Independent sort state for each table
 - Numeric sorting for NWK addresses, LQI, RSSI, counts, depth, and timestamps
 - Direct-route identification
+- Conservative scan-response freshness hints for router topology data
+- Cached-topology warning when a router definitely has not responded since the card started the current scan
 - Friendly next-hop route-state pills:
   - **Direct**
   - **No route**
@@ -27,6 +32,8 @@ A Home Assistant Lovelace custom card for inspecting detailed ZHA Zigbee topolog
 - Text and JSON topology export
 - Visible neighbor/child de-duplication by IEEE address, with NWK fallback
 - IEEE addresses available as tooltips on wider tables
+- **Not reported** parent status pill for end devices with no reported parent
+- Multiple-reported-parent warning when more than one router currently claims the same end device as a child
 
 ## Requirements
 
@@ -94,7 +101,7 @@ Settings → Dashboards → three-dot menu → Resources
 If you replace the JavaScript file manually and the browser continues to load an older cached copy, temporarily append a cache-busting query string such as:
 
 ```text
-/local/zha-topology-details-card.js?v=13
+/local/zha-topology-details-card.js?v=14
 ```
 
 ## Configuration / Dashboard creation
@@ -117,10 +124,13 @@ To add the card to an existing dashboard, simply edit that dashboard, add a **Ma
 type: custom:zha-topology-details-card
 title: Zigbee Topology Details
 show_end_devices: true
+show_route_paths: true
 grid_options:
   columns: 30
   rows: auto
 ```
+
+`show_route_paths` defaults to `true`. Set it to `false` if you want to hide the coordinator path summary and the inferred-path column in per-router routing tables.
 
 The `grid_options` section is useful with Home Assistant Sections dashboards and allows the topology report to use a wide layout. It may be omitted if your dashboard layout does not use Sections.
 
@@ -173,6 +183,14 @@ The status line shows scan progress and the time of the most recently loaded sna
 
 **Reload snapshot** only re-reads the current ZHA topology data. It does not start a new topology scan.
 
+When a scan is started from this card, v1.4 also tracks conservative response evidence from each router's `last_seen` value:
+
+- **Responded since scan started** means the device transmitted after the card started the scan. This does **not** prove that both its neighbor and routing tables were refreshed.
+- **Not refreshed this scan** means the router has not transmitted since the scan began. In that case, displayed neighbor/routing data are cached from an earlier successful scan and the card labels them accordingly.
+- **Response timing uncertain** is used around timestamp-resolution boundaries where the card cannot classify the result conservatively.
+
+The card intentionally labels this field as device-response evidence rather than a topology-update timestamp because the current ZHA devices payload does not expose per-table topology freshness timestamps.
+
 ## Routing-table annotations
 
 The raw Zigbee next-hop address remains visible in the **Next hop** column. The **Next-hop device** column adds a friendly annotation when useful:
@@ -185,6 +203,40 @@ The raw Zigbee next-hop address remains visible in the **Next hop** column. The 
 | **Unresolved** | `next_hop` is `0xFFFE` with another route state. |
 
 `0xFFFE` is preserved in the raw table and JSON data.
+
+## Inferred route paths
+
+v1.4 can infer a likely forwarding path by recursively following the currently reported routing tables.
+
+For example, if the coordinator reports destination `0x1234` through `0x534A`, and `0x534A` reports that same destination through `0x5A91`, and `0x5A91` reports the destination as direct, the card displays an inferred path such as:
+
+```text
+Coordinator → Bedroom MG21 → Garage MG21 → Destination
+```
+
+Each path includes a hop-count pill. The inference is directional and is **not** a packet trace. Route tables can be stale, and the return path may be different.
+
+When an intermediate router has no matching route entry but reports the destination as a direct neighbor, the card may use that neighbor relationship for the final hop and labels the result **Neighbor finish**.
+
+Path-status pills include:
+
+| Annotation | Meaning |
+| --- | --- |
+| **Neighbor finish** | Final hop was inferred from a reported neighbor relationship because no matching route entry was reported. |
+| **Unknown destination** | The route reaches a NWK address that does not currently belong to a registered ZHA device; the route may be stale. |
+| **No routing info** | The next router reports no routing-table entries, so the path cannot be continued. |
+| **Path incomplete** | A reported next hop was found, but the remaining path cannot be resolved from current topology data. |
+| **Possible loop** | Following reported next hops revisits a router already in the inferred path. |
+| **Hop limit** | Path inference reached the card's 30-hop safety limit. |
+
+A router that reports an empty routing table can still be functioning as a Zigbee router. The card therefore says **No routing entries reported** rather than implying that the device is not routing traffic.
+
+## Reported parents
+
+The **End devices / reported parents** section is derived from routers that currently report an end device with neighbor relationship `Child`.
+
+- If no router reports the end device as a child, v1.4 displays a neutral **Not reported** pill.
+- If more than one router reports the same end device as a child, the card shows all reported parent names plus a **Multiple reported (N)** warning pill. An end device cannot actually have multiple simultaneous Zigbee parents, so at least one reported child-table entry may be stale.
 
 ## Zigbee depth display
 
@@ -206,6 +258,18 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 **Copy JSON** preserves the raw ZHA topology data. UI-only presentation changes such as de-duplication, friendly depth labels, route pills, and table sorting do not alter the raw JSON export.
 
 ## Version history
+
+### v1.4 — 2026-09-02
+
+- Added coordinator and per-router inferred route paths with hop-count pills.
+- Added path diagnostics for neighbor-finished paths, unknown/stale destinations, missing routing information, incomplete paths, possible loops, and the inference hop limit.
+- Added conservative scan-response freshness hints based on router `last_seen` evidence.
+- Added cached-topology warnings for routers that definitely did not respond after the card started a topology scan.
+- Changed router detail wording to **Last device response** to avoid implying a topology-table timestamp.
+- Added a neutral **Not reported** pill in the end-device reported-parent column.
+- Added multiple-reported-parent conflict detection and warning pills.
+- Clarified that an empty reported routing table does not mean a device is not routing.
+- Added `show_route_paths` configuration option, enabled by default.
 
 ### v1.3 — 2026-08-31
 
@@ -233,7 +297,7 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 
 ## Current release
 
-**v1.3**
+**v1.4**
 
 ## Author
 

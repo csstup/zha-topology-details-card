@@ -1,7 +1,7 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.3
- * Date: 2026-08-31
+ * Version: 1.4
+ * Date: 2026-09-02
  *
  * Author: Corey Stup
  * Developed with assistance from ChatGPT (OpenAI GPT-5.6 Sol)
@@ -9,6 +9,7 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.4 - 2026-09-02 - Add inferred route paths, scan-response freshness hints, reported-parent status pills/conflict detection, and clearer empty-route messaging.
  *   v1.3 - 2026-08-31 - Fix progressive topology-scan refreshes, stabilize the header/status layout, and add sortable table columns.
  *   v1.2 - 2026-08-31 - Display depth 15 as Max (15) and add friendly next-hop route-state pills.
  *   v1.1 - 2026-08-31 - Display Zigbee depth 255 (0xFF) as Unknown.
@@ -16,12 +17,14 @@
  */
 
 /*
- * ZHA Topology Details Card v1.3
+ * ZHA Topology Details Card v1.4
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
  *   type: custom:zha-topology-details-card
  *   title: Zigbee Topology Details
+ *   show_end_devices: true
+ *   show_route_paths: true
  *
  * Resource:
  *   /local/zha-topology-details-card.js
@@ -40,6 +43,8 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     this._status = "";
     this._lastLoaded = null;
     this._scanTimers = [];
+    this._scanStartedAt = null;
+    this._scanBaselineLastSeen = new Map();
     this._sortState = new Map();
   }
 
@@ -47,6 +52,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     this._config = {
       title: "Zigbee Topology Details",
       show_end_devices: true,
+      show_route_paths: true,
       ...config,
     };
     this._render();
@@ -105,6 +111,18 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     // promise would never resolve and the delayed snapshot reloads below would
     // never be scheduled.
     const delays = [5000, 12000, 25000, 45000];
+
+    // Keep conservative, frontend-only evidence about whether each router has
+    // transmitted since this card started the scan. This does NOT prove that a
+    // specific Mgmt_Lqi/Mgmt_Rtg response succeeded; it only lets us identify
+    // routers that definitely have not responded since the scan began.
+    this._scanStartedAt = new Date();
+    this._scanBaselineLastSeen = new Map(
+      this._devices.map((d) => [
+        String(d?.ieee || this._hexNwk(d?.nwk)).toLowerCase(),
+        this._timeValue(d?.last_seen),
+      ])
+    );
 
     try {
       this._hass.connection.sendMessage({
@@ -356,6 +374,251 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     return null;
   }
 
+  _timeValue(v) {
+    if (v === undefined || v === null || v === "") return null;
+    try {
+      let d;
+      if (typeof v === "number") {
+        d = new Date(v < 2e10 ? v * 1000 : v);
+      } else {
+        d = new Date(v);
+      }
+      const ms = d.getTime();
+      return Number.isFinite(ms) ? ms : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _scanResponseEvidence(d) {
+    if (!this._scanStartedAt) return null;
+
+    const scanMs = this._scanStartedAt.getTime();
+    const currentMs = this._timeValue(d?.last_seen);
+    const key = String(d?.ieee || this._hexNwk(d?.nwk)).toLowerCase();
+    const baselineMs = this._scanBaselineLastSeen.get(key);
+
+    if (currentMs !== null && baselineMs !== null && currentMs > baselineMs) {
+      return {
+        state: "responded",
+        label: "Responded since scan started",
+        className: "scan-responded",
+        title:
+          "The device's last-response timestamp advanced after this card started the topology scan. This proves the device transmitted, but does not prove that every neighbor or routing table was refreshed.",
+      };
+    }
+
+    // ZHA last_seen is commonly second-resolution. Give the boundary a small
+    // tolerance so a response in the same second as the click is not falsely
+    // labeled stale.
+    if (currentMs !== null && currentMs < scanMs - 2000) {
+      return {
+        state: "stale",
+        label: "Not refreshed this scan",
+        className: "scan-stale",
+        title:
+          "The device has not transmitted since this topology scan began. Any neighbor or routing data shown for this router is cached from an earlier successful scan.",
+      };
+    }
+
+    return {
+      state: "uncertain",
+      label: "Response timing uncertain",
+      className: "scan-uncertain",
+      title:
+        "The last-response timestamp is too close to the scan start, or unavailable, to classify conservatively.",
+    };
+  }
+
+  _routeForDestination(device, destNwk) {
+    const matches = (device?.routes || []).filter((r) =>
+      this._sameNwk(r?.dest_nwk, destNwk)
+    );
+    if (!matches.length) return null;
+
+    return (
+      matches.find(
+        (r) => String(r?.route_status || "").toLowerCase() === "active"
+      ) || matches[0]
+    );
+  }
+
+  _neighborForNwk(device, nwk) {
+    return this._uniqueNeighbors(device?.neighbors).find((n) =>
+      this._sameNwk(n?.nwk, nwk)
+    );
+  }
+
+  _pathNode(nwk, indexes) {
+    const device = this._lookupNwk(nwk, indexes);
+    return {
+      nwk,
+      device,
+      label: device ? this._name(device) : this._hexNwk(nwk),
+    };
+  }
+
+  _inferRoutePath(source, initialRoute, indexes) {
+    const destNwk = initialRoute?.dest_nwk;
+    const nodes = [this._pathNode(source?.nwk, indexes)];
+    const visited = new Set([this._hexNwk(source?.nwk).toLowerCase()]);
+    let current = source;
+    let route = initialRoute;
+    let hops = 0;
+    let status = "complete";
+    let note = "";
+    const maxHops = 30;
+
+    for (let step = 0; step < maxHops; step += 1) {
+      const nextHopHex = this._hexNwk(route?.next_hop).toUpperCase();
+      const annotation = this._nextHopAnnotation(route);
+
+      if (nextHopHex === "0XFFFE") {
+        status = annotation?.className?.replace("route-", "") || "unresolved";
+        note = annotation?.title || "No valid next hop is currently known.";
+        break;
+      }
+
+      const nextNwk = route?.next_hop;
+      hops += 1;
+      const nextNode = this._pathNode(nextNwk, indexes);
+      nodes.push(nextNode);
+
+      if (this._sameNwk(nextNwk, destNwk)) {
+        if (!nextNode.device) {
+          status = "unknown-destination";
+          note =
+            "The reported route reaches this NWK directly, but that destination is not a current ZHA device. The route may be stale.";
+        }
+        break;
+      }
+
+      const nextKey = this._hexNwk(nextNwk).toLowerCase();
+      if (visited.has(nextKey)) {
+        status = "loop";
+        note = "Following reported next hops revisits a router already in this path.";
+        break;
+      }
+      visited.add(nextKey);
+
+      if (!nextNode.device || !this._isRouterDevice(nextNode.device)) {
+        status = "incomplete";
+        note = `Cannot continue after ${nextNode.label}: the next hop is not a current router with topology data.`;
+        break;
+      }
+
+      current = nextNode.device;
+      const nextRoute = this._routeForDestination(current, destNwk);
+      if (nextRoute) {
+        route = nextRoute;
+        continue;
+      }
+
+      // A router may know the destination is a one-hop neighbor without
+      // retaining an explicit NWK routing-table entry for it. Use that reported
+      // adjacency only for the final hop and mark the inference accordingly.
+      const destNeighbor = this._neighborForNwk(current, destNwk);
+      if (destNeighbor) {
+        hops += 1;
+        const destNode = this._pathNode(destNwk, indexes);
+        nodes.push(destNode);
+        status = destNode.device ? "neighbor-finish" : "unknown-destination";
+        note = destNode.device
+          ? "The final hop is inferred from the router's neighbor table because no matching routing-table entry was reported."
+          : "The final hop is inferred from the neighbor table, but the destination is not a current ZHA device.";
+        break;
+      }
+
+      status = (current?.routes || []).length ? "incomplete" : "no-routing-info";
+      note = (current?.routes || []).length
+        ? `No reported route from ${this._name(current)} continues toward ${this._hexNwk(destNwk)}.`
+        : `${this._name(current)} reports no routing-table entries, so the inferred path cannot be continued from that router.`;
+      break;
+    }
+
+    if (hops >= maxHops && status === "complete" && !this._sameNwk(nodes.at(-1)?.nwk, destNwk)) {
+      status = "hop-limit";
+      note = "Path inference stopped at the 30-hop safety limit.";
+    }
+
+    return { nodes, hops, status, note };
+  }
+
+  _pathStatusMeta(status) {
+    const map = {
+      "neighbor-finish": {
+        label: "Neighbor finish",
+        className: "path-neighbor",
+      },
+      "unknown-destination": {
+        label: "Unknown destination",
+        className: "path-warning",
+      },
+      "no-routing-info": {
+        label: "No routing info",
+        className: "path-warning",
+      },
+      incomplete: {
+        label: "Path incomplete",
+        className: "path-warning",
+      },
+      loop: {
+        label: "Possible loop",
+        className: "path-error",
+      },
+      "hop-limit": {
+        label: "Hop limit",
+        className: "path-error",
+      },
+      "no-route": {
+        label: "No route",
+        className: "route-no-route",
+      },
+      resolving: {
+        label: "Resolving",
+        className: "route-resolving",
+      },
+      unresolved: {
+        label: "Unresolved",
+        className: "route-unresolved",
+      },
+    };
+    return map[status] || null;
+  }
+
+  _pathText(path) {
+    return (path?.nodes || []).map((n) => n.label).join(" -> ");
+  }
+
+  _pathHtml(path) {
+    const nodes = (path?.nodes || [])
+      .map(
+        (n) =>
+          `<span class="path-node" title="${this._escape(n.label)} · ${this._escape(
+            this._hexNwk(n.nwk)
+          )}">${this._escape(n.label)}</span>`
+      )
+      .join('<span class="path-arrow">→</span>');
+    const meta = this._pathStatusMeta(path?.status);
+    const hopLabel = `${path?.hops ?? 0} ${path?.hops === 1 ? "hop" : "hops"}`;
+
+    return `<div class="route-path" title="Inferred from currently reported routing and neighbor tables; this is not a packet trace.">
+      ${nodes}
+      <span class="badge path-hops">${this._escape(hopLabel)}</span>
+      ${
+        meta
+          ? `<span class="badge ${this._escape(meta.className)}" title="${this._escape(
+              path?.note || meta.label
+            )}">${this._escape(meta.label)}</span>`
+          : ""
+      }
+    </div>${
+      path?.note && meta
+        ? `<div class="muted path-note">${this._escape(path.note)}</div>`
+        : ""
+    }`;
+  }
+
   _indexes() {
     const byIeee = new Map();
     const byNwk = new Map();
@@ -451,7 +714,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.3`);
+    out.push(`Card version: v1.4`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -513,12 +776,13 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         const dest = this._lookupNwk(r.dest_nwk, indexes);
         const hop = this._lookupNwk(r.next_hop, indexes);
         const annotation = this._nextHopAnnotation(r);
+        const path = this._inferRoutePath(d, r, indexes);
         out.push(
           `  dest=${this._hexNwk(r.dest_nwk)}${
             dest ? ` (${this._name(dest)})` : ""
           } -> next=${this._hexNwk(r.next_hop)}${
             hop ? ` (${this._name(hop)})` : ""
-          }${annotation ? ` [${annotation.label}]` : ""} | status=${r.route_status || "—"} | many_to_one=${
+          }${annotation ? ` [${annotation.label}]` : ""} | status=${r.route_status || "—"} | path=${this._pathText(path)} | hops=${path.hops} | path_state=${path.status} | many_to_one=${
             r.many_to_one
           } | memory_constrained=${r.memory_constrained} | route_record_required=${
             r.route_record_required
@@ -748,6 +1012,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         const activeRoutes = routes.filter(
           (r) => String(r.route_status || "").toLowerCase() === "active"
         ).length;
+        const scanEvidence = this._scanResponseEvidence(d);
 
         return `
           <tr>
@@ -781,6 +1046,12 @@ class ZhaTopologyDetailsCard extends HTMLElement {
             <td${this._sortAttrs(this._timeSortValue(d.last_seen))}>${this._escape(
               this._fmtLastSeen(d.last_seen)
             )}</td>
+            <td${this._sortAttrs(scanEvidence?.state || null)}>${scanEvidence
+                ? `<span class="badge ${this._escape(scanEvidence.className)}" title="${this._escape(
+                    scanEvidence.title
+                  )}">${this._escape(scanEvidence.label)}</span>`
+                : "—"}
+            </td>
           </tr>`;
       })
       .join("");
@@ -921,10 +1192,12 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   _routesTable(d, indexes) {
     const routes = d.routes || [];
+
     if (!routes.length)
-      return `<div class="empty">No route entries reported.</div>`;
+      return `<div class="empty">No routing entries reported. This does not mean the device is not routing.</div>`;
 
     const tableKey = `routes:${String(d.ieee || this._hexNwk(d.nwk))}`;
+    const showPaths = this._config.show_route_paths !== false;
 
     return `
       <div class="table-wrap">
@@ -934,6 +1207,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
             ${this._sortableTh("Destination device")}
             ${this._sortableTh("Next hop", "number")}
             ${this._sortableTh("Next-hop device")}
+            ${showPaths ? this._sortableTh("Inferred path", "number") : ""}
             ${this._sortableTh("Status", "number")}
             ${this._sortableTh("Many-to-one", "number")}
             ${this._sortableTh("Memory constrained", "number")}
@@ -952,6 +1226,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   : hop
                   ? this._name(hop)
                   : null;
+                const path = showPaths ? this._inferRoutePath(d, r, indexes) : null;
 
                 return `<tr>
                   <td${this._sortAttrs(
@@ -959,7 +1234,11 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   )}>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
                   <td${this._sortAttrs(dest ? this._name(dest) : null)}>${this._escape(
                     dest ? this._name(dest) : "—"
-                  )}</td>
+                  )}${
+                    !dest
+                      ? '<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
+                      : ""
+                  }</td>
                   <td${this._sortAttrs(
                     this._nwkSortValue(r.next_hop)
                   )}>${this._nwkWithIeee(r.next_hop, hop?.ieee)}</td>
@@ -975,6 +1254,14 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                         : ""
                     }
                   </td>
+                  ${
+                    showPaths
+                      ? `<td class="path-cell"${this._sortAttrs(
+                          Number.isFinite(path?.hops) ? path.hops : null,
+                          this._pathText(path)
+                        )}>${this._pathHtml(path)}</td>`
+                      : ""
+                  }
                   <td${this._sortAttrs(
                     this._routeStatusSortValue(r.route_status),
                     String(r.route_status || "")
@@ -998,6 +1285,60 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       </div>`;
   }
 
+  _coordinatorPathsTable(indexes) {
+    if (this._config.show_route_paths === false) return "";
+
+    const coordinator = this._devices.find(
+      (d) => d?.active_coordinator || this._sameNwk(d?.nwk, 0)
+    );
+    const routes = coordinator?.routes || [];
+    if (!coordinator || !routes.length) return "";
+
+    return `
+      <h3>Coordinator inferred route paths</h3>
+      <div class="table-wrap">
+        <table data-sort-key="coordinator-paths">
+          <thead><tr>
+            ${this._sortableTh("Destination", "number")}
+            ${this._sortableTh("Destination device")}
+            ${this._sortableTh("Inferred path", "number")}
+            ${this._sortableTh("Route status", "number")}
+          </tr></thead>
+          <tbody>
+            ${routes
+              .map((r) => {
+                const dest = this._lookupNwk(r.dest_nwk, indexes);
+                const path = this._inferRoutePath(coordinator, r, indexes);
+                return `<tr>
+                  <td${this._sortAttrs(
+                    this._nwkSortValue(r.dest_nwk)
+                  )}>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
+                  <td${this._sortAttrs(dest ? this._name(dest) : null)}>${this._escape(
+                    dest ? this._name(dest) : "—"
+                  )}${
+                    !dest
+                      ? '<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
+                      : ""
+                  }</td>
+                  <td class="path-cell"${this._sortAttrs(
+                    Number.isFinite(path?.hops) ? path.hops : null,
+                    this._pathText(path)
+                  )}>${this._pathHtml(path)}</td>
+                  <td${this._sortAttrs(
+                    this._routeStatusSortValue(r.route_status),
+                    String(r.route_status || "")
+                  )}><span class="badge route-${this._escape(
+                    String(r.route_status || "").toLowerCase()
+                  )}">${this._escape(r.route_status || "—")}</span></td>
+                </tr>`;
+              })
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="muted route-path-help">Paths are inferred by recursively following each router's reported next hop. The final hop may use a reported neighbor relationship when no matching route entry is present. Paths are directional and are not packet traces.</div>`;
+  }
+
   _routerDetails(indexes) {
     return this._devices
       .filter((d) => this._isRouterDevice(d))
@@ -1010,6 +1351,8 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         const neighbors = this._uniqueNeighbors(d.neighbors);
         const children = neighbors.filter((n) => this._isChild(n));
         const routes = d.routes || [];
+        const scanEvidence = this._scanResponseEvidence(d);
+        const stale = scanEvidence?.state === "stale";
         return `
           <details class="router-detail">
             <summary>
@@ -1031,17 +1374,34 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                 <span><b>LQI:</b> ${this._escape(d.lqi ?? "—")}</span>
                 <span><b>RSSI:</b> ${this._escape(d.rssi ?? "—")}</span>
                 <span><b>Available:</b> ${d.available ? "Yes" : "No"}</span>
-                <span><b>Last seen:</b> ${this._escape(this._fmtLastSeen(d.last_seen))}</span>
+                <span><b>Last device response:</b> ${this._escape(this._fmtLastSeen(d.last_seen))}</span>
+                ${
+                  scanEvidence
+                    ? `<span><b>Scan evidence:</b> <span class="badge ${this._escape(
+                        scanEvidence.className
+                      )}" title="${this._escape(scanEvidence.title)}">${this._escape(
+                        scanEvidence.label
+                      )}</span></span>`
+                    : ""
+                }
               </div>
 
-              <h4>Direct children (${children.length})</h4>
-              ${this._childrenTable(d, indexes)}
+              ${
+                stale
+                  ? `<div class="topology-warning">Cached — router has not responded since this topology scan began. Neighbor and routing data below were not refreshed by this scan.</div>`
+                  : ""
+              }
 
-              <h4>Full neighbor table (${neighbors.length})</h4>
-              ${this._neighborsTable(d, indexes)}
+              <div class="topology-section${stale ? " topology-cached" : ""}">
+                <h4>Direct children (${children.length})</h4>
+                ${this._childrenTable(d, indexes)}
 
-              <h4>Routing table (${routes.length})</h4>
-              ${this._routesTable(d, indexes)}
+                <h4>Full neighbor table (${neighbors.length})</h4>
+                ${this._neighborsTable(d, indexes)}
+
+                <h4>Routing table (${routes.length})</h4>
+                ${this._routesTable(d, indexes)}
+              </div>
             </div>
           </details>`;
       })
@@ -1057,12 +1417,19 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     if (!ends.length) return "";
 
-    // Find reported parent by searching router neighbor tables for Child relationship.
+    // Find reported parents by searching router neighbor tables for Child
+    // relationships. Keep all reporters so stale child tables can be surfaced
+    // instead of silently letting the last router overwrite earlier claims.
     const parentMap = new Map();
     for (const r of this._devices.filter((d) => this._isRouterDevice(d))) {
       for (const n of this._uniqueNeighbors(r.neighbors)) {
         if (this._isChild(n) && n.ieee) {
-          parentMap.set(String(n.ieee).toLowerCase(), r);
+          const key = String(n.ieee).toLowerCase();
+          const parents = parentMap.get(key) || [];
+          if (!parents.some((p) => String(p?.ieee || "").toLowerCase() === String(r?.ieee || "").toLowerCase())) {
+            parents.push(r);
+          }
+          parentMap.set(key, parents);
         }
       }
     }
@@ -1083,7 +1450,19 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           <tbody>
             ${ends
               .map((d) => {
-                const p = parentMap.get(String(d.ieee || "").toLowerCase());
+                const parents = parentMap.get(String(d.ieee || "").toLowerCase()) || [];
+                const parentNames = parents.map((p) => this._name(p));
+                const parentSort = parentNames.length
+                  ? parentNames.join(" | ")
+                  : "Not reported";
+                let parentHtml;
+                if (!parents.length) {
+                  parentHtml = '<span class="badge parent-not-reported" title="No router in the current reported neighbor tables claims this end device as a Child.">Not reported</span>';
+                } else if (parents.length === 1) {
+                  parentHtml = this._escape(parentNames[0]);
+                } else {
+                  parentHtml = `${parentNames.map((name) => this._escape(name)).join(" · ")}<span class="badge parent-conflict" title="More than one router currently reports this end device as a Child. At least one child-table entry may be stale.">Multiple reported (${parents.length})</span>`;
+                }
                 return `<tr>
                   <td${this._sortAttrs(this._name(d))}><strong>${this._escape(
                     this._name(d)
@@ -1095,9 +1474,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td class="mono"${this._sortAttrs(
                     this._nwkSortValue(d.nwk)
                   )}>${this._escape(this._hexNwk(d.nwk))}</td>
-                  <td${this._sortAttrs(p ? this._name(p) : "Not reported")}>${this._escape(
-                    p ? this._name(p) : "Not reported"
-                  )}</td>
+                  <td${this._sortAttrs(parentSort)}>${parentHtml}</td>
                   <td class="num ${this._lqiClass(d.lqi)}"${this._sortAttrs(
                     d.lqi
                   )}>${this._escape(d.lqi ?? "—")}</td>
@@ -1214,6 +1591,57 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           font-size:.72rem; margin-left:5px; background:var(--secondary-background-color);
         }
         .coord { background:color-mix(in srgb,var(--primary-color) 20%,transparent); }
+        .parent-not-reported {
+          margin-left:0;
+          color:var(--secondary-text-color);
+          background:var(--secondary-background-color);
+        }
+        .parent-conflict, .scan-stale, .path-warning {
+          font-weight:700;
+          background:color-mix(in srgb,var(--warning-color, #ffa600) 18%,var(--secondary-background-color));
+        }
+        .scan-responded {
+          margin-left:0;
+          font-weight:700;
+          background:color-mix(in srgb,var(--primary-color) 16%,var(--secondary-background-color));
+        }
+        .scan-uncertain {
+          margin-left:0;
+          color:var(--secondary-text-color);
+        }
+        .path-error {
+          font-weight:700;
+          background:color-mix(in srgb,var(--error-color, #db4437) 18%,var(--secondary-background-color));
+        }
+        .path-neighbor {
+          background:color-mix(in srgb,var(--primary-color) 10%,var(--secondary-background-color));
+        }
+        .path-hops { margin-left:2px; font-weight:700; }
+        .path-cell { white-space:normal; min-width:300px; }
+        .route-path { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
+        .path-node {
+          display:inline-block;
+          max-width:155px;
+          overflow:hidden;
+          text-overflow:ellipsis;
+          white-space:nowrap;
+          border:1px solid var(--divider-color);
+          border-radius:999px;
+          padding:2px 7px;
+          background:var(--secondary-background-color);
+          font-size:.76rem;
+        }
+        .path-arrow { color:var(--secondary-text-color); }
+        .path-note { white-space:normal; max-width:620px; }
+        .route-path-help { margin-top:6px; }
+        .topology-warning {
+          margin-top:10px;
+          padding:8px 10px;
+          border-left:3px solid var(--warning-color, #ffa600);
+          background:color-mix(in srgb,var(--warning-color, #ffa600) 10%,var(--secondary-background-color));
+          font-size:.82rem;
+        }
+        .topology-cached { opacity:.82; }
         .rel-child { font-weight:700; }
         .route-active { font-weight:700; }
         .route-direct {
@@ -1312,11 +1740,14 @@ class ZhaTopologyDetailsCard extends HTMLElement {
               ${this._sortableTh("Active/Routes", "number", "num")}
               ${this._sortableTh("LQI", "number", "num")}
               ${this._sortableTh("RSSI", "number", "num")}
-              ${this._sortableTh("Last seen", "number")}
+              ${this._sortableTh("Last response", "number")}
+              ${this._sortableTh("Scan response")}
             </tr></thead>
             <tbody>${this._routerSummaryRows(indexes)}</tbody>
           </table>
         </div>
+
+        ${this._coordinatorPathsTable(indexes)}
 
         ${this._endDeviceTable(indexes)}
 
@@ -1337,11 +1768,19 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           Visible neighbor/child tables and counts are de-duplicated by IEEE address (NWK fallback);
           Copy JSON preserves the raw ZHA data.
           Route-table destinations and next hops are separate from the neighbor table.
-          A missing sleepy child is not absolute proof of a different parent: topology scans
-          depend on each device answering Zigbee management requests correctly.
+          Inferred route paths recursively follow reported next hops and may use a neighbor-table
+          relationship for the final hop; they are directional inferences, not packet traces.
+          An “Unknown destination” path badge usually means the route points to a NWK address that
+          is no longer registered in ZHA and may therefore be stale. A router that reports no
+          routing entries may still route traffic. After a topology scan started from this card,
+          “Not refreshed this scan” means the router has not transmitted since the scan began, so
+          its displayed topology is cached; “Responded since scan started” proves only that the
+          device transmitted, not that both management tables refreshed successfully. A missing
+          sleepy child is not absolute proof of a different parent, and multiple routers may
+          temporarily report the same child when one child table is stale.
         </div>
 
-        <div class="version-footer">ZHA Topology Details Card v1.3</div>
+        <div class="version-footer">ZHA Topology Details Card v1.4</div>
       </ha-card>
     `;
 
@@ -1362,6 +1801,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "zha-topology-details-card",
   name: "ZHA Topology Details",
-  description: "Detailed sortable ZHA child, neighbor, and routing tables with topology scan controls.",
+  description: "Detailed sortable ZHA child, neighbor, routing, and inferred-path tables with topology scan controls.",
   preview: false,
 });
