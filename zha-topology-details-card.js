@@ -1,6 +1,6 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.5
+ * Version: 1.6
  * Date: 2026-09-26
  *
  * Author: Corey Stup
@@ -9,6 +9,7 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.6 - 2026-09-26 - Clean up route displays: collapse direct next-hop devices, align hop badges, and split coordinator hop count into its own column.
  *   v1.5 - 2026-09-26 - Compact inferred-route display and recognize Zigbee broadcast destinations 0xFFFC/0xFFFD/0xFFFF.
  *   v1.4 - 2026-09-02 - Add inferred route paths, scan-response freshness hints, reported-parent status pills/conflict detection, and clearer empty-route messaging.
  *   v1.3 - 2026-08-31 - Fix progressive topology-scan refreshes, stabilize the header/status layout, and add sortable table columns.
@@ -18,7 +19,7 @@
  */
 
 /*
- * ZHA Topology Details Card v1.5
+ * ZHA Topology Details Card v1.6
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
@@ -682,9 +683,65 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       : "";
 
     return `<div class="route-path" title="Inferred from currently reported routing and neighbor tables; this is not a packet trace.">
+      ${hopLabel ? `<span class="badge path-hops">${this._escape(hopLabel)}</span>` : ""}
       ${nodes ? '<span class="path-via">via</span>' : ""}
       ${nodes}
-      ${hopLabel ? `<span class="badge path-hops">${this._escape(hopLabel)}</span>` : ""}
+      ${
+        meta
+          ? `<span class="badge ${this._escape(meta.className)}" title="${this._escape(
+              path?.note || meta.label
+            )}">${this._escape(meta.label)}</span>`
+          : ""
+      }
+    </div>`;
+  }
+
+
+  _coordinatorHopHtml(path) {
+    if (path?.status === "broadcast") return "—";
+
+    if (path?.hops === 1 && path?.status === "complete") {
+      return `<span class="badge route-direct">Direct</span>`;
+    }
+
+    if (Number.isFinite(path?.hops)) {
+      const hopLabel = `${path.hops} ${path.hops === 1 ? "hop" : "hops"}`;
+      return `<span class="badge path-hops">${this._escape(hopLabel)}</span>`;
+    }
+
+    return "—";
+  }
+
+  _coordinatorPathHtml(path) {
+    if (path?.status === "broadcast") {
+      const special = path?.specialDestination || {};
+      return `<div class="route-path" title="${this._escape(
+        path?.note || "Zigbee broadcast destination; no single unicast path applies."
+      )}">
+        <span class="badge path-broadcast">Broadcast</span>
+        <span class="path-detail">${this._escape(
+          special.detail || "Special destination"
+        )}</span>
+      </div>`;
+    }
+
+    // Direct routes need no path text: the Hops column already says Direct.
+    if (path?.hops === 1 && path?.status === "complete") return "";
+
+    const meta = this._pathStatusMeta(path?.status);
+    const compactNodes = this._compactPathNodes(path);
+    const nodes = compactNodes
+      .map(
+        (n) =>
+          `<span class="path-node" title="${this._escape(n.label)} · ${this._escape(
+            this._hexNwk(n.nwk)
+          )}">${this._escape(n.label)}</span>`
+      )
+      .join('<span class="path-arrow">→</span>');
+
+    return `<div class="route-path" title="Inferred from currently reported routing and neighbor tables; this is not a packet trace.">
+      ${nodes ? '<span class="path-via">via</span>' : ""}
+      ${nodes}
       ${
         meta
           ? `<span class="badge ${this._escape(meta.className)}" title="${this._escape(
@@ -790,7 +847,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.5`);
+    out.push(`Card version: v1.6`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -1326,8 +1383,17 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td${this._sortAttrs(
                     this._nwkSortValue(r.next_hop)
                   )}>${this._nwkWithIeee(r.next_hop, hop?.ieee)}</td>
-                  <td${this._sortAttrs(hopDeviceSort)}>
-                    ${unresolved ? "" : this._escape(hop ? this._name(hop) : "—")}
+                  <td${this._sortAttrs(
+                    annotation?.label === "Direct" ? "Direct" : hopDeviceSort
+                  )}>
+                    ${
+                      annotation?.label === "Direct"
+                        ? `<span class="badge ${this._escape(
+                            annotation.className
+                          )}" title="${this._escape(
+                            annotation.title
+                          )}">${this._escape(annotation.label)}</span>`
+                        : `${unresolved ? "" : this._escape(hop ? this._name(hop) : "—")}
                     ${
                       annotation
                         ? `<span class="badge ${this._escape(
@@ -1336,6 +1402,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                             annotation.title
                           )}">${this._escape(annotation.label)}</span>`
                         : ""
+                    }`
                     }
                   </td>
                   ${
@@ -1385,7 +1452,8 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           <thead><tr>
             ${this._sortableTh("Destination", "number")}
             ${this._sortableTh("Destination device")}
-            ${this._sortableTh("Path", "number")}
+            ${this._sortableTh("Hops", "number")}
+            ${this._sortableTh("Path")}
             ${this._sortableTh("Route status", "number")}
           </tr></thead>
           <tbody>
@@ -1412,10 +1480,16 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                         )}</span>`
                       : '—<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
                   }</td>
+                  <td${this._sortAttrs(
+                    path?.hops === 1 && path?.status === "complete"
+                      ? 1
+                      : Number.isFinite(path?.hops)
+                      ? path.hops
+                      : null
+                  )}>${this._coordinatorHopHtml(path)}</td>
                   <td class="path-cell"${this._sortAttrs(
-                    Number.isFinite(path?.hops) ? path.hops : null,
                     this._pathText(path)
-                  )}>${this._pathHtml(path)}</td>
+                  )}>${this._coordinatorPathHtml(path)}</td>
                   <td${this._sortAttrs(
                     this._routeStatusSortValue(r.route_status),
                     String(r.route_status || "")
@@ -1428,7 +1502,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           </tbody>
         </table>
       </div>
-      <div class="muted route-path-help"><b>Path:</b> Direct = one hop. “via” lists only intermediate routers; source and destination are implicit. Neighbor = final hop inferred from a neighbor table. Incomplete/Loop indicate that the reported route chain could not be completed. Broadcast destinations do not have a single unicast path. Paths are directional and are not packet traces.</div>`;
+      <div class="muted route-path-help"><b>Hops:</b> Direct = one-hop route; otherwise the pill shows the inferred hop count. <b>Path:</b> “via” lists only intermediate routers; source and destination are implicit. Neighbor = final hop inferred from a neighbor table. Incomplete/Loop indicate that the reported route chain could not be completed. Broadcast destinations do not have a single unicast path. Paths are directional and are not packet traces.</div>`;
   }
 
   _routerDetails(indexes) {
@@ -1712,7 +1786,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           font-weight:700;
           background:color-mix(in srgb,var(--primary-color) 10%,var(--secondary-background-color));
         }
-        .path-hops { margin-left:2px; font-weight:700; }
+        .path-hops { margin-left:0; font-weight:700; }
         .path-cell { white-space:normal; min-width:180px; }
         .route-path { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
         .path-node {

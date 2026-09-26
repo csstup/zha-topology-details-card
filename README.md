@@ -2,6 +2,17 @@
 
 A Home Assistant Lovelace custom card for inspecting detailed ZHA Zigbee topology information.
 
+
+
+## v1.6 changes
+
+- In router routing tables, direct next hops now show only a `Direct` pill instead of repeating the device name.
+- In router Path columns, direct routes show `Direct`; multi-hop routes begin with the hop-count pill, followed by `via ...`.
+- Coordinator inferred routes now have a separate **Hops** column before **Path**.
+- Coordinator direct routes show `Direct` in **Hops** and leave **Path** blank.
+- Coordinator multi-hop/incomplete routes show the hop-count pill in **Hops** and only the intermediate `via ...` route plus status badges in **Path**.
+- These changes align direct/hop indicators vertically and make longer routes easier to scan.
+
 ## Features
 
 - Router and coordinator summary
@@ -206,7 +217,7 @@ The raw Zigbee next-hop address remains visible in the **Next hop** column. The 
 
 ## Inferred route paths
 
-v1.5 keeps the v1.4 route inference engine but presents the result more compactly by omitting the already-known source and destination from each path.
+v1.6 keeps the v1.4 route inference engine but presents the result more compactly by omitting the already-known source and destination from each path.
 
 For example, a two-hop route is shown as:
 
@@ -263,7 +274,7 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 
 ## Version history
 
-### v1.5 — 2026-09-26
+### v1.6 — 2026-09-26
 
 - Compacted route-path display: direct routes now show **Direct** and multi-hop paths list only intermediate routers.
 - Removed repeated source and destination names from every inferred path row.
@@ -309,7 +320,7 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 
 ## Current release
 
-**v1.5**
+**v1.6**
 
 ## Author
 
