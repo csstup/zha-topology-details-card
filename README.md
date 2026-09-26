@@ -206,27 +206,31 @@ The raw Zigbee next-hop address remains visible in the **Next hop** column. The 
 
 ## Inferred route paths
 
-v1.4 can infer a likely forwarding path by recursively following the currently reported routing tables.
+v1.5 keeps the v1.4 route inference engine but presents the result more compactly by omitting the already-known source and destination from each path.
 
-For example, if the coordinator reports destination `0x1234` through `0x534A`, and `0x534A` reports that same destination through `0x5A91`, and `0x5A91` reports the destination as direct, the card displays an inferred path such as:
+For example, a two-hop route is shown as:
 
 ```text
-Coordinator → Bedroom MG21 → Garage MG21 → Destination
+via Bedroom Router   2 hops
 ```
 
-Each path includes a hop-count pill. The inference is directional and is **not** a packet trace. Route tables can be stale, and the return path may be different.
+rather than repeating `Coordinator → Bedroom Router → Destination`. A direct one-hop route is shown simply as **Direct**. For three or more hops, only the intermediate routers are listed.
 
-When an intermediate router has no matching route entry but reports the destination as a direct neighbor, the card may use that neighbor relationship for the final hop and labels the result **Neighbor finish**.
+The inference is directional and is **not** a packet trace. Route tables can be stale, and the return path may be different.
+
+When an intermediate router has no matching route entry but reports the destination as a direct neighbor, the card may use that neighbor relationship for the final hop and adds a compact **Neighbor** pill. The longer explanation is available as hover text/legend instead of being repeated below every row.
+
+The Zigbee special broadcast destinations `0xFFFC`, `0xFFFD`, and `0xFFFF` are recognized explicitly. They are labeled as broadcasts and are not treated as unknown devices or assigned a single inferred unicast path.
 
 Path-status pills include:
 
 | Annotation | Meaning |
 | --- | --- |
-| **Neighbor finish** | Final hop was inferred from a reported neighbor relationship because no matching route entry was reported. |
+| **Neighbor** | Final hop was inferred from a reported neighbor relationship because no matching route entry was reported. |
 | **Unknown destination** | The route reaches a NWK address that does not currently belong to a registered ZHA device; the route may be stale. |
 | **No routing info** | The next router reports no routing-table entries, so the path cannot be continued. |
-| **Path incomplete** | A reported next hop was found, but the remaining path cannot be resolved from current topology data. |
-| **Possible loop** | Following reported next hops revisits a router already in the inferred path. |
+| **Incomplete** | A reported next hop was found, but the remaining path cannot be resolved from current topology data. |
+| **Loop** | Following reported next hops revisits a router already in the inferred path. |
 | **Hop limit** | Path inference reached the card's 30-hop safety limit. |
 
 A router that reports an empty routing table can still be functioning as a Zigbee router. The card therefore says **No routing entries reported** rather than implying that the device is not routing traffic.
@@ -258,6 +262,14 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 **Copy JSON** preserves the raw ZHA topology data. UI-only presentation changes such as de-duplication, friendly depth labels, route pills, and table sorting do not alter the raw JSON export.
 
 ## Version history
+
+### v1.5 — 2026-09-26
+
+- Compacted route-path display: direct routes now show **Direct** and multi-hop paths list only intermediate routers.
+- Removed repeated source and destination names from every inferred path row.
+- Shortened path-state pills such as **Neighbor**, **Incomplete**, and **Loop**, with detailed explanations moved to tooltip/legend text.
+- Reduced the minimum path-column width for a denser routing table.
+- Added explicit handling for Zigbee broadcast destinations `0xFFFC`, `0xFFFD`, and `0xFFFF`; these are no longer shown as unknown destinations or given a unicast path/hop count.
 
 ### v1.4 — 2026-09-02
 
@@ -297,7 +309,7 @@ Depth describes the reported Zigbee tree depth. It should not be interpreted as 
 
 ## Current release
 
-**v1.4**
+**v1.5**
 
 ## Author
 

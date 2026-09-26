@@ -1,7 +1,7 @@
 /*
  * ZHA Topology Details Card
- * Version: 1.4
- * Date: 2026-09-02
+ * Version: 1.5
+ * Date: 2026-09-26
  *
  * Author: Corey Stup
  * Developed with assistance from ChatGPT (OpenAI GPT-5.6 Sol)
@@ -9,6 +9,7 @@
  * Repository: zha-topology-details-card
  *
  * Revision History:
+ *   v1.5 - 2026-09-26 - Compact inferred-route display and recognize Zigbee broadcast destinations 0xFFFC/0xFFFD/0xFFFF.
  *   v1.4 - 2026-09-02 - Add inferred route paths, scan-response freshness hints, reported-parent status pills/conflict detection, and clearer empty-route messaging.
  *   v1.3 - 2026-08-31 - Fix progressive topology-scan refreshes, stabilize the header/status layout, and add sortable table columns.
  *   v1.2 - 2026-08-31 - Display depth 15 as Max (15) and add friendly next-hop route-state pills.
@@ -17,7 +18,7 @@
  */
 
 /*
- * ZHA Topology Details Card v1.4
+ * ZHA Topology Details Card v1.5
  * Uses Home Assistant's authenticated frontend WebSocket connection.
  *
  * Dashboard YAML:
@@ -430,6 +431,28 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     };
   }
 
+  _specialNwkDestination(nwk) {
+    const key = this._hexNwk(nwk).toUpperCase();
+    const destinations = {
+      "0XFFFC": {
+        label: "Broadcast",
+        detail: "Routers + coordinator",
+        title: "Zigbee broadcast to all routers and the coordinator (0xFFFC).",
+      },
+      "0XFFFD": {
+        label: "Broadcast",
+        detail: "Always-on devices",
+        title: "Zigbee broadcast to all receiver-on-when-idle devices (0xFFFD).",
+      },
+      "0XFFFF": {
+        label: "Broadcast",
+        detail: "All devices",
+        title: "Zigbee broadcast to all devices in the PAN (0xFFFF).",
+      },
+    };
+    return destinations[key] || null;
+  }
+
   _routeForDestination(device, destNwk) {
     const matches = (device?.routes || []).filter((r) =>
       this._sameNwk(r?.dest_nwk, destNwk)
@@ -460,6 +483,18 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
   _inferRoutePath(source, initialRoute, indexes) {
     const destNwk = initialRoute?.dest_nwk;
+    const specialDestination = this._specialNwkDestination(destNwk);
+    if (specialDestination) {
+      return {
+        nodes: [],
+        hops: null,
+        status: "broadcast",
+        note: specialDestination.title,
+        destNwk,
+        specialDestination,
+      };
+    }
+
     const nodes = [this._pathNode(source?.nwk, indexes)];
     const visited = new Set([this._hexNwk(source?.nwk).toLowerCase()]);
     let current = source;
@@ -541,14 +576,18 @@ class ZhaTopologyDetailsCard extends HTMLElement {
       note = "Path inference stopped at the 30-hop safety limit.";
     }
 
-    return { nodes, hops, status, note };
+    return { nodes, hops, status, note, destNwk };
   }
 
   _pathStatusMeta(status) {
     const map = {
       "neighbor-finish": {
-        label: "Neighbor finish",
+        label: "Neighbor",
         className: "path-neighbor",
+      },
+      broadcast: {
+        label: "Broadcast",
+        className: "path-broadcast",
       },
       "unknown-destination": {
         label: "Unknown destination",
@@ -559,11 +598,11 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         className: "path-warning",
       },
       incomplete: {
-        label: "Path incomplete",
+        label: "Incomplete",
         className: "path-warning",
       },
       loop: {
-        label: "Possible loop",
+        label: "Loop",
         className: "path-error",
       },
       "hop-limit": {
@@ -586,12 +625,50 @@ class ZhaTopologyDetailsCard extends HTMLElement {
     return map[status] || null;
   }
 
+  _compactPathNodes(path) {
+    const nodes = path?.nodes || [];
+    if (!nodes.length) return [];
+
+    let end = nodes.length;
+    if (path?.destNwk != null && this._sameNwk(nodes.at(-1)?.nwk, path.destNwk)) {
+      end -= 1;
+    }
+
+    // The source is implicit in both the coordinator summary and each
+    // per-router routing table. The destination already has its own column.
+    return nodes.slice(1, end);
+  }
+
   _pathText(path) {
-    return (path?.nodes || []).map((n) => n.label).join(" -> ");
+    if (path?.status === "broadcast") {
+      return `Broadcast: ${path?.specialDestination?.detail || "special destination"}`;
+    }
+    if (path?.hops === 1 && path?.status === "complete") return "Direct";
+    const via = this._compactPathNodes(path).map((n) => n.label).join(" -> ");
+    return via ? `via ${via}` : this._pathStatusMeta(path?.status)?.label || "—";
   }
 
   _pathHtml(path) {
-    const nodes = (path?.nodes || [])
+    if (path?.status === "broadcast") {
+      const special = path?.specialDestination || {};
+      return `<div class="route-path" title="${this._escape(
+        path?.note || "Zigbee broadcast destination; no single unicast path applies."
+      )}">
+        <span class="badge path-broadcast">Broadcast</span>
+        <span class="path-detail">${this._escape(special.detail || "Special destination")}</span>
+      </div>`;
+    }
+
+    const meta = this._pathStatusMeta(path?.status);
+
+    if (path?.hops === 1 && path?.status === "complete") {
+      return `<div class="route-path" title="Direct one-hop route to the destination.">
+        <span class="badge route-direct">Direct</span>
+      </div>`;
+    }
+
+    const compactNodes = this._compactPathNodes(path);
+    const nodes = compactNodes
       .map(
         (n) =>
           `<span class="path-node" title="${this._escape(n.label)} · ${this._escape(
@@ -599,12 +676,15 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           )}">${this._escape(n.label)}</span>`
       )
       .join('<span class="path-arrow">→</span>');
-    const meta = this._pathStatusMeta(path?.status);
-    const hopLabel = `${path?.hops ?? 0} ${path?.hops === 1 ? "hop" : "hops"}`;
+
+    const hopLabel = Number.isFinite(path?.hops)
+      ? `${path.hops} ${path.hops === 1 ? "hop" : "hops"}`
+      : "";
 
     return `<div class="route-path" title="Inferred from currently reported routing and neighbor tables; this is not a packet trace.">
+      ${nodes ? '<span class="path-via">via</span>' : ""}
       ${nodes}
-      <span class="badge path-hops">${this._escape(hopLabel)}</span>
+      ${hopLabel ? `<span class="badge path-hops">${this._escape(hopLabel)}</span>` : ""}
       ${
         meta
           ? `<span class="badge ${this._escape(meta.className)}" title="${this._escape(
@@ -612,11 +692,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
             )}">${this._escape(meta.label)}</span>`
           : ""
       }
-    </div>${
-      path?.note && meta
-        ? `<div class="muted path-note">${this._escape(path.note)}</div>`
-        : ""
-    }`;
+    </div>`;
   }
 
   _indexes() {
@@ -714,7 +790,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
 
     const out = [];
     out.push(`ZHA TOPOLOGY DUMP`);
-    out.push(`Card version: v1.4`);
+    out.push(`Card version: v1.5`);
     out.push(`Generated: ${new Date().toLocaleString()}`);
     out.push(`Devices: ${this._devices.length}`);
     out.push("");
@@ -1207,7 +1283,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
             ${this._sortableTh("Destination device")}
             ${this._sortableTh("Next hop", "number")}
             ${this._sortableTh("Next-hop device")}
-            ${showPaths ? this._sortableTh("Inferred path", "number") : ""}
+            ${showPaths ? this._sortableTh("Path", "number") : ""}
             ${this._sortableTh("Status", "number")}
             ${this._sortableTh("Many-to-one", "number")}
             ${this._sortableTh("Memory constrained", "number")}
@@ -1232,12 +1308,20 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td${this._sortAttrs(
                     this._nwkSortValue(r.dest_nwk)
                   )}>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
-                  <td${this._sortAttrs(dest ? this._name(dest) : null)}>${this._escape(
-                    dest ? this._name(dest) : "—"
-                  )}${
-                    !dest
-                      ? '<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
-                      : ""
+                  <td${this._sortAttrs(
+                    dest
+                      ? this._name(dest)
+                      : this._specialNwkDestination(r.dest_nwk)?.detail || null
+                  )}>${
+                    dest
+                      ? this._escape(this._name(dest))
+                      : this._specialNwkDestination(r.dest_nwk)
+                      ? `<span class="badge path-broadcast" title="${this._escape(
+                          this._specialNwkDestination(r.dest_nwk).title
+                        )}">Broadcast</span><span class="broadcast-detail">${this._escape(
+                          this._specialNwkDestination(r.dest_nwk).detail
+                        )}</span>`
+                      : '—<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
                   }</td>
                   <td${this._sortAttrs(
                     this._nwkSortValue(r.next_hop)
@@ -1301,7 +1385,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           <thead><tr>
             ${this._sortableTh("Destination", "number")}
             ${this._sortableTh("Destination device")}
-            ${this._sortableTh("Inferred path", "number")}
+            ${this._sortableTh("Path", "number")}
             ${this._sortableTh("Route status", "number")}
           </tr></thead>
           <tbody>
@@ -1313,12 +1397,20 @@ class ZhaTopologyDetailsCard extends HTMLElement {
                   <td${this._sortAttrs(
                     this._nwkSortValue(r.dest_nwk)
                   )}>${this._nwkWithIeee(r.dest_nwk, dest?.ieee)}</td>
-                  <td${this._sortAttrs(dest ? this._name(dest) : null)}>${this._escape(
-                    dest ? this._name(dest) : "—"
-                  )}${
-                    !dest
-                      ? '<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
-                      : ""
+                  <td${this._sortAttrs(
+                    dest
+                      ? this._name(dest)
+                      : this._specialNwkDestination(r.dest_nwk)?.detail || null
+                  )}>${
+                    dest
+                      ? this._escape(this._name(dest))
+                      : this._specialNwkDestination(r.dest_nwk)
+                      ? `<span class="badge path-broadcast" title="${this._escape(
+                          this._specialNwkDestination(r.dest_nwk).title
+                        )}">Broadcast</span><span class="broadcast-detail">${this._escape(
+                          this._specialNwkDestination(r.dest_nwk).detail
+                        )}</span>`
+                      : '—<span class="badge path-warning" title="No current ZHA device has this NWK address; the route may be stale.">Unknown destination</span>'
                   }</td>
                   <td class="path-cell"${this._sortAttrs(
                     Number.isFinite(path?.hops) ? path.hops : null,
@@ -1336,7 +1428,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           </tbody>
         </table>
       </div>
-      <div class="muted route-path-help">Paths are inferred by recursively following each router's reported next hop. The final hop may use a reported neighbor relationship when no matching route entry is present. Paths are directional and are not packet traces.</div>`;
+      <div class="muted route-path-help"><b>Path:</b> Direct = one hop. “via” lists only intermediate routers; source and destination are implicit. Neighbor = final hop inferred from a neighbor table. Incomplete/Loop indicate that the reported route chain could not be completed. Broadcast destinations do not have a single unicast path. Paths are directional and are not packet traces.</div>`;
   }
 
   _routerDetails(indexes) {
@@ -1616,8 +1708,12 @@ class ZhaTopologyDetailsCard extends HTMLElement {
         .path-neighbor {
           background:color-mix(in srgb,var(--primary-color) 10%,var(--secondary-background-color));
         }
+        .path-broadcast {
+          font-weight:700;
+          background:color-mix(in srgb,var(--primary-color) 10%,var(--secondary-background-color));
+        }
         .path-hops { margin-left:2px; font-weight:700; }
-        .path-cell { white-space:normal; min-width:300px; }
+        .path-cell { white-space:normal; min-width:180px; }
         .route-path { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
         .path-node {
           display:inline-block;
@@ -1632,6 +1728,8 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           font-size:.76rem;
         }
         .path-arrow { color:var(--secondary-text-color); }
+        .path-via, .path-detail, .broadcast-detail { color:var(--secondary-text-color); font-size:.78rem; }
+        .broadcast-detail { margin-left:5px; }
         .path-note { white-space:normal; max-width:620px; }
         .route-path-help { margin-top:6px; }
         .topology-warning {
@@ -1770,8 +1868,11 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           Route-table destinations and next hops are separate from the neighbor table.
           Inferred route paths recursively follow reported next hops and may use a neighbor-table
           relationship for the final hop; they are directional inferences, not packet traces.
-          An “Unknown destination” path badge usually means the route points to a NWK address that
-          is no longer registered in ZHA and may therefore be stale. A router that reports no
+          Direct routes are shown simply as “Direct”; multi-hop paths list only intermediate routers
+          because source and destination are already implied by the table. Zigbee broadcast destinations
+          0xFFFC, 0xFFFD, and 0xFFFF are identified explicitly and are not treated as unknown devices or
+          given a single inferred unicast path. An “Unknown destination” badge on other NWK addresses
+          usually means the route points to an address that is no longer registered in ZHA and may be stale. A router that reports no
           routing entries may still route traffic. After a topology scan started from this card,
           “Not refreshed this scan” means the router has not transmitted since the scan began, so
           its displayed topology is cached; “Responded since scan started” proves only that the
@@ -1780,7 +1881,7 @@ class ZhaTopologyDetailsCard extends HTMLElement {
           temporarily report the same child when one child table is stale.
         </div>
 
-        <div class="version-footer">ZHA Topology Details Card v1.4</div>
+        <div class="version-footer">ZHA Topology Details Card v1.5</div>
       </ha-card>
     `;
 
